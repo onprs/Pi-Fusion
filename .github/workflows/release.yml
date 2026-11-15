@@ -21,7 +21,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: "24"
           registry-url: "https://registry.npmjs.org"
           cache: "npm"
 
@@ -39,23 +39,32 @@ jobs:
             const tag = process.env.GITHUB_REF_NAME || "";
             const version = tag.replace(/^v/, "");
             const content = fs.readFileSync("CHANGELOG.md", "utf8");
-            const escaped = version.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-            const regex = new RegExp(`^##\\s+\\[?${escaped}\\]?[^\\n]*\\n([\\s\\S]*?)(?=^##\\s+|\\Z)`, "m");
-            const match = content.match(regex);
-            const notes = match && match[1] ? match[1].trim() : `Release ${tag}`;
+            const lines = content.split(/\r?\n/);
+            let capturing = false;
+            const out = [];
+            for (const line of lines) {
+              if (/^##\s+/.test(line)) {
+                if (capturing) break;
+                if (line.includes(version)) capturing = true;
+                continue;
+              }
+              if (capturing) out.push(line);
+            }
+            const notes = out.join("\n").trim() || `Release ${tag}`;
             fs.writeFileSync("release-notes.md", notes + "\n", "utf8");
           '
 
-      - name: Create GitHub Release
+      - name: Create or update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "${{ github.ref_name }}" \
-            --notes-file release-notes.md
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            gh release edit "${{ github.ref_name }}" --title "${{ github.ref_name }}" --notes-file release-notes.md
+          else
+            gh release create "${{ github.ref_name }}" --title "${{ github.ref_name }}" --notes-file release-notes.md
+          fi
 
       - name: Publish to npm
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish --provenance --access public

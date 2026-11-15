@@ -1,5 +1,12 @@
 # 更新日志
 
+## [0.1.1]
+
+### 功能改进
+
+- 支持 GitHub Actions OIDC Trusted Publishing 自动发布。
+- 新增 `/fusion explain`、`/fusion classifier`、`/fusion models import` 与 `/router` 命令别名。
+
 ## [0.1.0]
 
 ### 新增功能
