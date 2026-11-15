@@ -1,0 +1,68 @@
+{
+  "version": 1,
+  "enabled": true,
+  "mode": "auto",
+  "virtualModel": {
+    "provider": "router",
+    "id": "fusion",
+    "name": "Fusion Router"
+  },
+  "classifier": {
+    "provider": "auto",
+    "model": "jev-latest",
+    "timeoutMs": 2500,
+    "minConfidence": 0.35
+  },
+  "models": [
+    {
+      "provider": "anthropic",
+      "id": "claude-opus-4-5",
+      "priority": 95,
+      "costTier": "premium",
+      "specialty": "Complex architecture, cross-module refactoring, deep debugging, and critical reviews",
+      "avoid": "Trivial formatting or simple one-line edits",
+      "defaultThinking": "high"
+    },
+    {
+      "provider": "anthropic",
+      "id": "claude-sonnet-4-5",
+      "priority": 85,
+      "costTier": "balanced",
+      "specialty": "Day-to-day feature development, multi-step coding, and test writing",
+      "defaultThinking": "medium"
+    },
+    {
+      "provider": "openai",
+      "id": "gpt-4o-mini",
+      "priority": 65,
+      "costTier": "budget",
+      "specialty": "Fast lookups, documentation drafts, and simple isolated edits",
+      "defaultThinking": "off"
+    }
+  ],
+  "fallbackChain": [
+    "anthropic/claude-sonnet-4-5",
+    "openai/gpt-4o-mini"
+  ],
+  "thinkingMode": "auto",
+  "redecision": {
+    "stickyDuringToolLoop": true,
+    "redecideOnConsecutiveToolErrors": 2,
+    "periodicReviewSteps": 8,
+    "redecideOnTaskShift": true,
+    "minSwitchBenefitConfidence": 0.55,
+    "protectThinkingSignature": true
+  },
+  "health": {
+    "enabled": true,
+    "autoFailover": true,
+    "cooldownSeconds": 90,
+    "maxCooldownSeconds": 900
+  },
+  "preferences": "Prioritize accuracy for architecture and debugging, and prefer fast budget models for simple tasks.",
+  "ui": {
+    "showStatusBar": true,
+    "notifyOnSwitch": false,
+    "notifyOnFailover": true
+  }
+}
