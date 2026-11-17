@@ -23,8 +23,8 @@ Pi-Fusion 通过 `pi.registerVirtualModel` 注册虚拟模型（默认 `router/f
 | `src/classifier.ts` | 分类器链解析、自定义端点注册、紧凑摘要构造、响应校验、超时与备用链 |
 | `src/policy.ts` | 轮次步数与连续工具错误统计、Thinking 签名保护、周期复查、切换收益门控 |
 | `src/router.ts` | `direct` / `retry` / `continuation` / `user` 四分支路由状态机 |
-| `src/ui.ts` | 状态栏、切换通知、`SettingsList` 设置面板 |
-| `src/commands.ts` | `/fusion` 与 `/router` 子命令、候选模型管理菜单、分类器选择 |
+| `src/ui.ts` | 状态栏、切换通知、`openTabbedSplitWorkspace` 横向分区双栏工作台（窄屏自动上下排布）、`selectMenuPanel` 与 3 分区设置面板 |
+| `src/commands.ts` | `/fusion`（`/router`）4 分区双栏控制中心、全部子命令及模型/分类器/健康/干跑测试双栏交互视图 |
 | `src/index.ts` | 扩展入口：加载配置、注册虚拟模型与自定义分类器端点、绑定事件与命令 |
 
 ## 配置系统
@@ -37,7 +37,7 @@ Pi-Fusion 通过 `pi.registerVirtualModel` 注册虚拟模型（默认 `router/f
 
 - 对象字段逐键合并，标量与普通数组整体替换。
 - `models` 按 `provider/id` 合并：已存在的模型只覆盖该层显式写出的字段（例如项目层只写 `enabled: false` 时保留全局画像），新模型追加。
-- `classifier.customEndpoint` 为 `null` 时清除下层的自定义端点；`defaultModel` 为空字符串时清除默认模型；候选模型的 `defaultThinking` 为 `null` 时清除该字段。
+- `classifier.customEndpoint` 为 `null` 时清除下层的自定义端点，`customEndpoint.apiKeyEnv` 为空字符串时清除旧密钥变量名；`defaultModel` 为空字符串时清除默认模型；候选模型的 `defaultThinking` 为 `null` 时清除该字段。
 
 ### 写入
 
@@ -136,6 +136,7 @@ Pi 仅在可重试的上游错误（`isRetryableAssistantError`）或上下文�
 ## 扩展开发说明
 
 - 新增配置字段：在 `types.ts` 声明类型与补丁类型，在 `constants.ts` 提供默认值，在 `mergeAndValidateConfig` 增加校验；候选模型画像字段还需加入 `PROFILE_OVERRIDE_FIELDS`。
-- 新增命令：在 `commands.ts` 中通过 `applyConfigPatch` 写入，只传递变更字段，并补充自动补全项。
+- 新增命令或界面：在 `commands.ts` 中通过 `applyConfigPatch` 写入，只传递变更字段，同步放入 `/fusion` 控制中心（`openFusionHub`）并补充自动补全项。
+- 自定义 TUI 组件：仅在 `ctx.mode === "tui"` 时调用 `ctx.ui.custom()`，其余交互模式回退至 `ctx.ui.select()`；组件内部一律使用 `custom` 回调注入的 `theme` 参数，避免依赖模块级全局主题实例。
 - 修改路由分支：保持“状态未变化时返回原引用”的约束，并在 `test/router.test.ts` 覆盖对应分支。
 - 所有文件读写测试必须使用 `os.tmpdir()` 下的临时目录，并通过 `PI_CODING_AGENT_DIR` 隔离全局配置。

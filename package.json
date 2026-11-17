@@ -1,6 +1,6 @@
 {
   "name": "pi-fusion-router",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Multi-model dynamic router for Pi Coding Agent powered by native decision classifiers",
   "license": "MIT",
   "type": "module",

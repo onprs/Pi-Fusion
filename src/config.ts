@@ -478,7 +478,11 @@ export function mergeAndValidateConfig(
 			} else if (ep.api !== undefined) {
 				warnings.push(`classifier.customEndpoint.api "${String(ep.api)}" 无效，已忽略`);
 			}
-			if (typeof ep.apiKeyEnv === "string" && ep.apiKeyEnv.trim()) endpoint.apiKeyEnv = ep.apiKeyEnv.trim();
+			if (typeof ep.apiKeyEnv === "string") {
+				const trimmedEnv = ep.apiKeyEnv.trim();
+				if (trimmedEnv) endpoint.apiKeyEnv = trimmedEnv;
+				else delete endpoint.apiKeyEnv;
+			}
 			if (typeof ep.importFromPiClassifier === "boolean") {
 				endpoint.importFromPiClassifier = ep.importFromPiClassifier;
 			}

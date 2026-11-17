@@ -66,20 +66,21 @@ pi -e ./src/index.ts --model router/fusion
 
 在 Pi 交互界面中输入 `/fusion`（或 `/router`）即可管理路由器：
 
-- `/fusion` 或 `/fusion config`：打开交互式设置面板
+- `/fusion`：打开横向分区双栏路由控制中心（支持 `←`/`→`、`Tab` 或数字键切换「概览与诊断」「路由策略」「模型与分类器」「健康与测试」分区，左栏操作配置，右栏实时展示状态与详情）
+- `/fusion config`：打开分区双栏路由策略与界面设置面板
 - `/fusion status`：查看当前路由状态、决策模型、冷却中的模型与配置文件路径
 - `/fusion explain`：查看最近一次路由决策详情（触发原因、推荐模型、置信度、切换收益与耗时）
-- `/fusion models`：打开候选模型管理菜单（启用/停用、设为默认、修改优先级、成本档位、默认思考强度、擅长与不适用场景）
+- `/fusion models`：打开候选模型管理菜单（启用/停用、设为默认、修改优先级、成本档位、默认思考强度、擅长场景、不适用场景与显示名称）
 - `/fusion models list`：列出候选模型池及健康状态
 - `/fusion models import`：导入当前已认证物理模型至配置文件
 - `/fusion models enable|disable <provider/model>`：启用或停用候选模型
 - `/fusion models default <provider/model|clear>`：设置或清除默认回退模型
 - `/fusion models set <provider/model> <字段> <值>`：修改 `priority`、`costTier`、`thinking`、`specialty`、`avoid`、`label`
-- `/fusion classifier`：选择专用决策模型；`/fusion classifier list` 列出可用决策模型链
+- `/fusion classifier`：打开决策分类器管理菜单（查看分类器链、切换决策模型、配置/导入/清除自定义端点、调整超时与最低置信度）；`/fusion classifier list` 列出可用决策模型链
 - `/fusion classifier <auto|provider/model>`：切换为自动发现或指定决策模型
 - `/fusion classifier endpoint <baseUrl|clear>`：配置或清除自定义决策端点
 - `/fusion classifier import`：导入全局分类器端点设置
-- `/fusion health [reset [provider/model]]`：查看或重置模型冷却记录
+- `/fusion health [manage | reset [provider/model]]`：查看健康状态、打开健康与冷却管理菜单或重置模型冷却记录
 - `/fusion mode <auto|observe|on|off>`：切换运行模式或启停路由
 - `/fusion enable` / `/fusion disable`：启用或停用动态路由
 - `/fusion reload`：重新加载配置文件

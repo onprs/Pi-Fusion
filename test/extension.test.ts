@@ -11,6 +11,7 @@ import {
 	type ExtensionVirtualModel,
 	VIRTUAL_MODEL_STATE_ENTRY,
 } from "@earendil-works/pi-coding-agent";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import fusionExtension from "../src/index.ts";
 import type { FusionRouteState } from "../src/types.ts";
 
@@ -56,6 +57,7 @@ interface Harness {
 	unregisteredProviders: string[];
 	notifications: string[];
 	statusUpdates: Array<string | undefined>;
+	selectTitles: string[];
 	selectAnswers: Array<string | undefined | ((options: string[]) => string | undefined)>;
 	inputAnswers: Array<string | undefined>;
 	ctx: ExtensionCommandContext;
@@ -94,6 +96,7 @@ function createHarness(root: string, options?: { withBranchState?: boolean }): H
 	const unregisteredProviders: string[] = [];
 	const notifications: string[] = [];
 	const statusUpdates: Array<string | undefined> = [];
+	const selectTitles: string[] = [];
 	const selectAnswers: Harness["selectAnswers"] = [];
 	const inputAnswers: Harness["inputAnswers"] = [];
 
@@ -133,7 +136,8 @@ function createHarness(root: string, options?: { withBranchState?: boolean }): H
 			notify: (msg: string) => notifications.push(msg),
 			setStatus: (_key: string, text: string | undefined) => statusUpdates.push(text),
 			theme: { fg: (_color: string, text: string) => text, bold: (text: string) => text },
-			select: async (_title: string, opts: string[]) => {
+			select: async (title: string, opts: string[]) => {
+				selectTitles.push(title);
 				const next = selectAnswers.shift();
 				return typeof next === "function" ? next(opts) : next;
 			},
@@ -183,6 +187,7 @@ function createHarness(root: string, options?: { withBranchState?: boolean }): H
 		unregisteredProviders,
 		notifications,
 		statusUpdates,
+		selectTitles,
 		selectAnswers,
 		inputAnswers,
 		ctx,
@@ -440,5 +445,186 @@ describe("index 扩展集成与命令冒烟测试", () => {
 		await h.run("classifier endpoint clear");
 		assert.equal((h.readJson(h.globalPath).classifier as Record<string, unknown>).customEndpoint, null);
 		assert.equal(h.unregisteredProviders.includes("fusion-classifier"), true);
+	});
+
+	it("/fusion 进入分区控制中心后可查看并配置所有子功能", async () => {
+		writeProjectModels();
+		const h = createHarness(root, { withBranchState: true });
+		await h.startSession();
+
+		// 先让 gpt-4o-mini 进入冷却，便于验证控制中心内的健康查看与重置
+		for (const fn of h.handlers.get("message_end") ?? []) {
+			await fn(
+				{
+					message: {
+						role: "assistant",
+						provider: "openai",
+						model: "gpt-4o-mini",
+						stopReason: "error",
+						errorMessage: "429 rate limit",
+					},
+				},
+				h.ctx,
+			);
+		}
+
+		const byPrefix = (prefix: string) => (options: string[]) => options.find((o) => o.startsWith(prefix));
+
+		h.selectAnswers.push(
+			// 1. 分区「概览与诊断」：切换运行模式 -> 查看最近决策详情并发起干跑测试 -> 重新加载配置 -> 返回分区列表
+			byPrefix("概览与诊断"),
+			byPrefix("运行模式"),
+			byPrefix("最近一次决策详情"),
+			"执行干跑路由测试",
+			byPrefix("重新加载配置文件"),
+			"返回分区列表",
+			// 2. 分区「路由策略」：关闭粘性保持 -> 连续报错阈值从 2 循环一次到 3 -> 修改切换收益置信度 -> 编辑偏好 -> 编辑回退链 -> 返回
+			byPrefix("路由策略"),
+			byPrefix("工具循环粘性保持"),
+			byPrefix("连续工具报错阈值"),
+			byPrefix("切换收益最低置信度"),
+			byPrefix("编辑路由偏好说明"),
+			byPrefix("编辑备用模型回退链"),
+			"返回分区列表",
+			// 3. 分区「模型与分类器」：配置自定义决策端点 -> 修改超时时间 -> 修改最低置信度 -> 返回
+			byPrefix("模型与分类器"),
+			byPrefix("配置自定义决策端点"),
+			"openai-decisions",
+			byPrefix("分类器超时与最低置信度"),
+			byPrefix("修改超时时间"),
+			byPrefix("分类器超时与最低置信度"),
+			byPrefix("修改最低置信度"),
+			"返回分区列表",
+			// 4. 分区「健康与测试」：单独重置冷却模型 -> 修改基础冷却时长 -> 返回 -> 退出控制中心
+			byPrefix("健康与测试"),
+			byPrefix("重置模型健康冷却"),
+			byPrefix("重置模型健康状态：openai/gpt-4o-mini"),
+			byPrefix("修改冷却时长范围"),
+			byPrefix("修改基础冷却时长"),
+			"返回分区列表",
+			undefined,
+		);
+
+		h.inputAnswers.push(
+			"编写并发限流器", // 干跑测试输入
+			"0.65", // 切换收益最低置信度
+			"架构任务优先使用高推理模型", // 路由偏好说明（editor）
+			"anthropic/claude-opus-4-5, openai/gpt-4o-mini", // 备用模型回退链
+			"https://classifier.example.com/v1/", // 自定义端点地址
+			"CUSTOM_DECISION_KEY", // 密钥环境变量
+			"4000", // 分类器超时时间
+			"0.5", // 分类器最低置信度
+			"120", // 基础冷却时长
+		);
+
+		await h.run("");
+
+		// 验证各分区展示的完整状态与诊断信息
+		assert.equal(h.selectTitles.some((t) => t.includes("Pi-Fusion 路由控制中心")), true);
+		assert.equal(h.selectTitles.some((t) => t.includes("冷却中: openai/gpt-4o-mini")), true);
+		assert.equal(h.selectTitles.some((t) => t.includes("最近一次路由决策详情") && t.includes("restored")), true);
+		assert.equal(h.notifications.some((n) => n.includes("编写并发限流器") && n.includes("推荐模型: anthropic/claude-opus-4-5")), true);
+		assert.equal(h.notifications.some((n) => n.includes("已重置模型健康状态: openai/gpt-4o-mini")), true);
+		assert.equal(h.notifications.some((n) => n.includes("已重新加载 Pi-Fusion 配置")), true);
+
+		// 验证所有配置均已准确保存至项目配置层
+		const saved = h.readJson(h.projectPath);
+		assert.equal(saved.mode, "observe");
+		assert.equal(saved.preferences, "架构任务优先使用高推理模型");
+		assert.deepEqual(saved.fallbackChain, ["anthropic/claude-opus-4-5", "openai/gpt-4o-mini"]);
+
+		const redecision = saved.redecision as Record<string, unknown>;
+		assert.equal(redecision.stickyDuringToolLoop, false);
+		assert.equal(redecision.redecideOnConsecutiveToolErrors, 3);
+		assert.equal(redecision.minSwitchBenefitConfidence, 0.65);
+
+		const classifier = saved.classifier as Record<string, unknown>;
+		assert.equal(classifier.timeoutMs, 4000);
+		assert.equal(classifier.minConfidence, 0.5);
+		assert.deepEqual(classifier.customEndpoint, {
+			baseUrl: "https://classifier.example.com/v1",
+			api: "openai-decisions",
+			apiKeyEnv: "CUSTOM_DECISION_KEY",
+			importFromPiClassifier: false,
+		});
+		assert.equal(h.registeredProviders.includes("fusion-classifier"), true);
+
+		const health = saved.health as Record<string, unknown>;
+		assert.equal(health.cooldownSeconds, 120);
+	});
+
+	it("TUI 模式下横向分区双栏工作台利用横向空间、联动右栏详情并自适应窄屏", async () => {
+		writeProjectModels();
+		const h = createHarness(root, { withBranchState: true });
+		await h.startSession();
+
+		const snapshots: Array<{ wide: string[]; narrow: string[] }> = [];
+
+		(h.ctx as unknown as { mode: string }).mode = "tui";
+		(h.ctx.ui as unknown as { custom: unknown }).custom = async (
+			factory: (
+				tui: { requestRender: () => void },
+				theme: { fg: (_c: string, s: string) => string; bold: (s: string) => string },
+				kb: unknown,
+				done: (result: unknown) => void,
+			) => { render: (w: number) => string[]; handleInput: (d: string) => void },
+		) => {
+			let finished = false;
+			let resolvedValue: unknown;
+			const comp = factory(
+				{ requestRender: () => {} },
+				{ fg: (_c: string, s: string) => s, bold: (s: string) => s },
+				{},
+				(res: unknown) => {
+					finished = true;
+					resolvedValue = res;
+				},
+			);
+
+			// 初始在分区 1「概览与诊断」：记录宽屏 100 列与窄屏 60 列渲染
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			// 按向下键两次选中「最近一次决策详情」，右栏应联动显示决策诊断
+			comp.handleInput("\x1b[B");
+			comp.handleInput("\x1b[B");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			// 按右方向键切换到分区 2「路由策略」，右栏应显示策略总览
+			comp.handleInput("\x1b[C");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			// 按数字键 1 切回分区 1（光标保持在此前选中的第 3 项），上移两次回到首项「路由器总开关」，按空格切换后按 Esc 关闭
+			comp.handleInput("1");
+			comp.handleInput("\x1b[A");
+			comp.handleInput("\x1b[A");
+			comp.handleInput(" ");
+			if (!finished) comp.handleInput("\x1b");
+			return resolvedValue;
+		};
+
+		await h.run("");
+
+		const firstWide = snapshots[0]!.wide;
+		const firstNarrow = snapshots[0]!.narrow;
+		// 宽屏包含 4 个横向分区标签与左右双栏竖向分隔线 │，且纵向紧凑、每行不超宽
+		assert.equal(firstWide.some((l) => l.includes("概览与诊断") && l.includes("路由策略") && l.includes("模型与分类器")), true);
+		assert.equal(firstWide.some((l) => l.includes("路由器总开关") && l.includes("│") && l.includes("路由状态概览")), true);
+		assert.equal(firstWide.length <= 22, true);
+		assert.equal(firstWide.every((l) => visibleWidth(l) <= 100), true);
+
+		// 窄屏自动退化为上下布局且每行不超过 60 列
+		assert.equal(firstNarrow.every((l) => visibleWidth(l) <= 60), true);
+		assert.equal(firstNarrow.some((l) => l.includes("路由器总开关") && l.includes("路由状态概览")), false);
+
+		// 光标移到「最近一次决策详情」后，右栏实时展示最近决策诊断（含 restored）
+		const secondWide = snapshots[1]!.wide;
+		assert.equal(secondWide.some((l) => l.includes("最近决策诊断")), true);
+		assert.equal(secondWide.some((l) => l.includes("restored")), true);
+
+		// 切到分区 2「路由策略」后，左栏展示策略项、右栏展示策略总览
+		const thirdWide = snapshots[2]!.wide;
+		assert.equal(thirdWide.some((l) => l.includes("思考强度模式") && l.includes("│")), true);
+		assert.equal(thirdWide.some((l) => l.includes("当前策略总览")), true);
+
+		// 空格切换总开关已保存生效
+		assert.equal(h.readJson(h.projectPath).enabled, false);
+		assert.equal(h.statusUpdates.at(-1), "Fusion: 已停用");
 	});
 });

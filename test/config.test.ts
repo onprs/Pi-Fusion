@@ -149,7 +149,12 @@ describe("config 配置系统", () => {
 		base.models = [
 			{ provider: "openai", id: "gpt-5", enabled: true, priority: 90, costTier: "premium", specialty: "架构设计", avoid: "简单问答" },
 		];
-		base.classifier.customEndpoint = { baseUrl: "https://classifier.example.com/v1" };
+		base.classifier.customEndpoint = { baseUrl: "https://classifier.example.com/v1", apiKeyEnv: "OLD_KEY" };
+
+		const { config: clearedKey } = mergeAndValidateConfig(base, {
+			classifier: { customEndpoint: { apiKeyEnv: "" } },
+		});
+		assert.equal(clearedKey.classifier.customEndpoint?.apiKeyEnv, undefined);
 
 		const { config } = mergeAndValidateConfig(base, {
 			models: [{ provider: "openai", id: "gpt-5", enabled: false }],
