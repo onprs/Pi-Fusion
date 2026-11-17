@@ -1,3 +1,4 @@
+import { type AssistantMessage, isRetryableAssistantError } from "@earendil-works/pi-ai";
 import { FAILURE_PATTERNS, HEALTH_DEBOUNCE_MS } from "./constants.ts";
 import type { FailureCategory, HealthConfig, ModelHealthSnapshot } from "./types.ts";
 
@@ -106,11 +107,16 @@ export function classifyModelFailure(
 	}
 
 	if (normalizedReason === "error") {
+		// 未匹配已知类别的错误：仅当 Pi 判定为可重试的上游故障时才冷却并转移
+		const retryable = isRetryableAssistantError({
+			stopReason: "error",
+			errorMessage: raw,
+		} as AssistantMessage);
 		return {
 			category: "unknown",
-			shouldCooldown: true,
-			shouldFailover: true,
-			summary: "未知模型响应异常",
+			shouldCooldown: retryable,
+			shouldFailover: retryable,
+			summary: retryable ? "上游临时故障" : "未知模型响应异常",
 		};
 	}
 

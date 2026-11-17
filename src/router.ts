@@ -192,14 +192,9 @@ export async function routeRequest(
 		throw new Error("未找到任何已配置凭据且可用的物理模型，请检查模型与凭据设置");
 	}
 
-	const previousModelKey = request.previous
-		? modelKey(request.previous.model.provider, request.previous.model.id)
-		: undefined;
-
-	// 当路由器被禁用或处于 observe 模式时，直接路由至默认/上一个模型
+	// 路由器停用时始终派发默认/回退模型，不写入路由状态，保持会话中已有状态不变
 	if (!config.enabled) {
-		const fallback = findCandidateByKey(pool, previousModelKey)
-			?? pickDefaultOrFallbackCandidate(pool.contextSafe, config)
+		const fallback = pickDefaultOrFallbackCandidate(pool.contextSafe, config)
 			?? pool.allResolved[0]!;
 		const thinkingLevel = resolveThinkingLevel({
 			physicalModel: fallback.model,
@@ -207,19 +202,7 @@ export async function routeRequest(
 			requestedThinkingLevel: request.thinkingLevel,
 			thinkingMode: "passthrough",
 		});
-		const finalized = finalizeRouteResult({
-			request,
-			selectedCandidate: fallback,
-			thinkingLevel,
-			trigger: "disabled",
-			reason: "路由器已禁用，使用默认/当前模型",
-			decidedAtTurnStep: prevState?.decidedAtTurnStep ?? 0,
-			continuationSteps: prevState?.continuationSteps ?? 0,
-			consecutiveToolErrors: 0,
-			attemptedModels: [fallback.key],
-		});
-		onRouteResolved?.({ ...finalized, trigger: "disabled" });
-		return finalized.route;
+		return { model: fallback.model, thinkingLevel };
 	}
 
 	// 1. Agent 循环外 direct 请求（如 Compaction 摘要）不读取/不修改会话状态
@@ -565,10 +548,13 @@ export async function routeRequest(
 		chosenCandidate = (currentIsHealthyAndSafe ? currentCandidate : undefined)
 			?? pickDefaultOrFallbackCandidate(pool.contextSafe, config)
 			?? pool.allResolved[0]!;
-		chosenTrigger = decision ? chosenTrigger : "fallback";
+		const singleCandidate = pool.forDecision.length <= 1;
+		if (!decision && !singleCandidate) chosenTrigger = "fallback";
 		reason = decision
 			? `回退至 ${chosenCandidate.key}`
-			: `分类器不可用或超时，回退至 ${chosenCandidate.key}`;
+			: singleCandidate
+				? `仅有 1 个可用候选模型，使用 ${chosenCandidate.key}`
+				: `分类器不可用或超时，回退至 ${chosenCandidate.key}`;
 	}
 
 	const thinkingLevel = resolveThinkingLevel({

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -11,6 +11,7 @@ import {
 	mergeAndValidateConfig,
 	migrateLegacyConfig,
 	parseModelKey,
+	saveConfigPatchToLayer,
 	saveFusionRouterConfig,
 } from "../src/config.ts";
 
@@ -138,6 +139,79 @@ describe("config 配置系统", () => {
 			const reloaded = loadFusionRouterConfig({ cwd: root, agentDir: join(root, "unused-agent") });
 			assert.equal(savedPath, getProjectConfigPath(root));
 			assert.equal(reloaded.config.preferences, "Prefer fast responses for small edits");
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("项目层模型条目仅覆盖显式提供的字段，并支持 null 清除自定义端点", () => {
+		const base = createDefaultConfig();
+		base.models = [
+			{ provider: "openai", id: "gpt-5", enabled: true, priority: 90, costTier: "premium", specialty: "架构设计", avoid: "简单问答" },
+		];
+		base.classifier.customEndpoint = { baseUrl: "https://classifier.example.com/v1" };
+
+		const { config } = mergeAndValidateConfig(base, {
+			models: [{ provider: "openai", id: "gpt-5", enabled: false }],
+			classifier: { customEndpoint: null },
+		});
+		const merged = config.models[0];
+		assert.equal(merged?.enabled, false);
+		assert.equal(merged?.priority, 90);
+		assert.equal(merged?.costTier, "premium");
+		assert.equal(merged?.specialty, "架构设计");
+		assert.equal(merged?.avoid, "简单问答");
+		assert.equal(config.classifier.customEndpoint, undefined);
+	});
+
+	it("按层写入配置补丁：保留该层原有内容、按模型键合并并转换旧版格式", () => {
+		const root = makeTempDir("pi-fusion-layer-");
+		try {
+			const agentDir = join(root, "agent");
+			mkdirSync(agentDir, { recursive: true });
+			const globalPath = getGlobalConfigPath(agentDir);
+			writeFileSync(
+				globalPath,
+				JSON.stringify({
+					preferences: "保留的偏好",
+					ui: { showStatusBar: false },
+					models: [{ provider: "openai", id: "gpt-5", priority: 90, specialty: "架构" }],
+				}),
+				"utf8",
+			);
+
+			saveConfigPatchToLayer(
+				{
+					ui: { notifyOnSwitch: true },
+					models: [
+						{ provider: "openai", id: "gpt-5", enabled: false },
+						{ provider: "google", id: "gemini-2.5-flash", costTier: "budget" },
+					],
+				},
+				{ scope: "global", agentDir },
+			);
+			const saved = JSON.parse(readFileSync(globalPath, "utf8")) as Record<string, unknown>;
+			assert.equal(saved.preferences, "保留的偏好");
+			assert.deepEqual(saved.ui, { showStatusBar: false, notifyOnSwitch: true });
+			assert.deepEqual(saved.models, [
+				{ provider: "openai", id: "gpt-5", priority: 90, specialty: "架构", enabled: false },
+				{ provider: "google", id: "gemini-2.5-flash", costTier: "budget" },
+			]);
+			assert.equal(saved.mode, undefined);
+
+			// 旧版三档配置先转换为当前格式再合并
+			const projectDir = join(root, "workspace");
+			mkdirSync(join(projectDir, ".pi"), { recursive: true });
+			writeFileSync(
+				getProjectConfigPath(projectDir),
+				JSON.stringify({ models: { high: "openai/gpt-5", low: "google/gemini-2.5-flash" } }),
+				"utf8",
+			);
+			saveConfigPatchToLayer({ mode: "observe" }, { scope: "project", cwd: projectDir });
+			const migrated = JSON.parse(readFileSync(getProjectConfigPath(projectDir), "utf8")) as Record<string, unknown>;
+			assert.equal(migrated.mode, "observe");
+			assert.ok(Array.isArray(migrated.models));
+			assert.equal((migrated.models as unknown[]).length, 2);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

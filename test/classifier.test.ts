@@ -8,7 +8,9 @@ import {
 	buildClassifierContext,
 	buildClassifierInputSummary,
 	readPiClassifierEndpointHints,
+	resolveClassifierApiKeyReference,
 	resolveClassifierChain,
+	resolveCustomClassifierTarget,
 	runClassifierDecision,
 } from "../src/classifier.ts";
 import { createDefaultConfig } from "../src/config.ts";
@@ -278,8 +280,48 @@ describe("classifier 决策器封装", () => {
 			const hints = readPiClassifierEndpointHints(root);
 			assert.equal(hints.baseUrl, "https://classifier.example.com/v1");
 			assert.equal(hints.model, "jev/jev-latest");
+
+			// 导入端点使用 pi-classifier 的模型，并在分类器链中优先于内置分类器
+			const cfg = createDefaultConfig();
+			cfg.classifier.customEndpoint = { importFromPiClassifier: true };
+			const target = resolveCustomClassifierTarget(cfg.classifier, root);
+			assert.deepEqual(target, {
+				providerId: "fusion-classifier",
+				modelId: "jev/jev-latest",
+				baseUrl: "https://classifier.example.com/v1",
+				api: "typesafe-system-one",
+			});
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}
+	});
+
+	it("自定义端点在分类器链中优先，并按配置与环境变量解析密钥引用", async () => {
+		const jev = makeClassifier("typesafe", "jev-latest");
+		const custom = makeClassifier("fusion-classifier", "jev-custom");
+		const registry = {
+			getAvailableOfType: async () => [jev, custom] as const,
+			findOfType: (_t: "classifier", p: string, id: string) =>
+				[jev, custom].find((m) => m.provider === p && m.id === id),
+		};
+		const cfg = createDefaultConfig();
+		cfg.classifier.model = "jev-custom";
+		cfg.classifier.customEndpoint = { baseUrl: "https://classifier.example.com/v1/" };
+
+		const autoChain = await resolveClassifierChain(registry, cfg.classifier);
+		assert.equal(autoChain[0]?.key, "fusion-classifier/jev-custom");
+		assert.equal(autoChain[0]?.source, "custom");
+
+		cfg.classifier.provider = "custom";
+		const customChain = await resolveClassifierChain(registry, cfg.classifier);
+		assert.equal(customChain[0]?.key, "fusion-classifier/jev-custom");
+
+		assert.equal(resolveClassifierApiKeyReference({ apiKeyEnv: "$MY_KEY" }, {}), "$MY_KEY");
+		assert.equal(resolveClassifierApiKeyReference({}, { TYPESAFE_API_KEY: "x" }), "$TYPESAFE_API_KEY");
+		assert.equal(
+			resolveClassifierApiKeyReference({}, { CLASSIFIER_API_KEY: "a", TYPESAFE_API_KEY: "b" }),
+			"$CLASSIFIER_API_KEY",
+		);
+		assert.equal(resolveClassifierApiKeyReference({}, {}), "$CLASSIFIER_API_KEY");
 	});
 });

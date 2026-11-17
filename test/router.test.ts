@@ -455,4 +455,110 @@ describe("router 核心路由引擎", () => {
 		assert.equal(res.thinkingLevel, "low");
 		assert.equal(res.state, undefined);
 	});
+
+	it("路由停用时派发默认模型、不调用 Classifier 且不写入新状态", async () => {
+		const opus = makeChatModel("anthropic", "claude-opus-4-5");
+		const mini = makeChatModel("openai", "gpt-4o-mini");
+		const jev = makeClassifierModel();
+		const cfg = createDefaultConfig();
+		cfg.enabled = false;
+		cfg.defaultModel = "openai/gpt-4o-mini";
+		cfg.models = [
+			{ provider: "anthropic", id: "claude-opus-4-5", enabled: true, priority: 95, costTier: "premium", specialty: "deep" },
+			{ provider: "openai", id: "gpt-4o-mini", enabled: true, priority: 60, costTier: "budget", specialty: "quick" },
+		];
+
+		const previousState: FusionRouteState = {
+			version: 1,
+			selectedModel: "anthropic/claude-opus-4-5",
+			thinkingLevel: "high",
+			decidedAtTurnStep: 0,
+			continuationSteps: 0,
+			consecutiveToolErrors: 0,
+			attemptedModels: ["anthropic/claude-opus-4-5"],
+			lastDecision: {
+				model: "anthropic/claude-opus-4-5",
+				thinkingLevel: "high",
+				reason: "init",
+				trigger: "user_initial",
+				timestamp: 1,
+			},
+		};
+
+		let classifyCalled = false;
+		let resolvedCalled = false;
+		for (const reason of ["user", "continuation", "direct"] as const) {
+			const res = await routeRequest(
+				{
+					model: makeVirtualModel(),
+					thinkingLevel: "medium",
+					reason,
+					state: reason === "direct" ? undefined : previousState,
+					messages: [{ role: "user", content: "重构模块", timestamp: 1 }],
+				},
+				{
+					modelRegistry: {
+						getAvailable: () => [opus, mini],
+						find: (p, id) => [opus, mini].find((m) => m.provider === p && m.id === id),
+						hasConfiguredAuth: () => true,
+						findOfType: () => jev,
+						getAvailableOfType: async () => [jev],
+						classify: async (): Promise<ClassifierResult> => {
+							classifyCalled = true;
+							throw new Error("不应调用");
+						},
+					},
+					config: cfg,
+					healthTracker: new ModelHealthTracker(),
+					onRouteResolved: () => {
+						resolvedCalled = true;
+					},
+				},
+			);
+			assert.equal(res.model.id, "gpt-4o-mini");
+			assert.equal(res.thinkingLevel, "medium");
+			assert.equal(res.state, undefined);
+		}
+		assert.equal(classifyCalled, false);
+		assert.equal(resolvedCalled, false);
+	});
+
+	it("仅有 1 个健康候选模型时跳过 Classifier 并准确记录决策说明", async () => {
+		const mini = makeChatModel("openai", "gpt-4o-mini");
+		const jev = makeClassifierModel();
+		const cfg = createDefaultConfig();
+		cfg.models = [
+			{ provider: "openai", id: "gpt-4o-mini", enabled: true, priority: 60, costTier: "budget", specialty: "quick" },
+		];
+
+		let classifyCalled = false;
+		const res = await routeRequest(
+			{
+				model: makeVirtualModel(),
+				thinkingLevel: "medium",
+				reason: "user",
+				messages: [{ role: "user", content: "解释这段代码", timestamp: 1 }],
+			},
+			{
+				modelRegistry: {
+					getAvailable: () => [mini],
+					find: (p, id) => [mini].find((m) => m.provider === p && m.id === id),
+					hasConfiguredAuth: () => true,
+					findOfType: () => jev,
+					getAvailableOfType: async () => [jev],
+					classify: async (): Promise<ClassifierResult> => {
+						classifyCalled = true;
+						throw new Error("不应调用");
+					},
+				},
+				config: cfg,
+				healthTracker: new ModelHealthTracker(),
+			},
+		);
+
+		assert.equal(classifyCalled, false);
+		assert.equal(res.model.id, "gpt-4o-mini");
+		assert.notEqual(res.state?.lastDecision.trigger, "fallback");
+		assert.match(res.state?.lastDecision.reason ?? "", /仅有 1 个可用候选模型/);
+	});
 });

@@ -14,8 +14,8 @@
 ## 环境要求
 
 - Node.js >= 22
-- Pi Coding Agent
-- 已配置至少 1 个可用物理模型凭据与 1 个专用决策模型凭据（或自定义决策端点）
+- Pi Coding Agent 1.5.2 或更高版本
+- 已配置至少 1 个可用物理模型凭据；建议同时配置 1 个专用决策模型凭据（或自定义决策端点），未配置时路由器使用默认模型
 
 ## 安装与使用
 
@@ -48,6 +48,15 @@ pi -e ./src/index.ts --model router/fusion
 
 完整配置示例见 [`examples/fusion-router.example.json`](./examples/fusion-router.example.json)。未创建配置文件时，路由器会自动发现当前已配置的可用模型并启用默认策略。
 
+通过命令或设置面板修改配置时，仅将变更项写入所选的配置文件；存在项目配置时默认写入项目配置。
+
+### 自定义决策端点
+
+使用 `/fusion classifier endpoint <baseUrl> [api] [密钥环境变量]` 配置兼容的决策端点：
+
+- `api` 可选 `typesafe-system-one`（默认）、`cloudflare-workers-ai-system-one`、`openai-decisions`
+- 未指定密钥环境变量时，依次使用已设置的 `CLASSIFIER_API_KEY`、`TYPESAFE_API_KEY`
+
 ### 运行模式
 
 - `auto`：自动按决策结果派发物理模型与思考深度。
@@ -58,10 +67,18 @@ pi -e ./src/index.ts --model router/fusion
 在 Pi 交互界面中输入 `/fusion`（或 `/router`）即可管理路由器：
 
 - `/fusion` 或 `/fusion config`：打开交互式设置面板
-- `/fusion status`：查看当前路由状态、决策模型与配置文件路径
+- `/fusion status`：查看当前路由状态、决策模型、冷却中的模型与配置文件路径
 - `/fusion explain`：查看最近一次路由决策详情（触发原因、推荐模型、置信度、切换收益与耗时）
-- `/fusion models [import]`：列出候选模型池及健康状态，或导入当前已认证物理模型至配置文件
-- `/fusion classifier [auto|import|<provider/model>]`：查看或切换专用决策模型，或导入全局分类器端点
+- `/fusion models`：打开候选模型管理菜单（启用/停用、设为默认、修改优先级、成本档位、默认思考强度、擅长与不适用场景）
+- `/fusion models list`：列出候选模型池及健康状态
+- `/fusion models import`：导入当前已认证物理模型至配置文件
+- `/fusion models enable|disable <provider/model>`：启用或停用候选模型
+- `/fusion models default <provider/model|clear>`：设置或清除默认回退模型
+- `/fusion models set <provider/model> <字段> <值>`：修改 `priority`、`costTier`、`thinking`、`specialty`、`avoid`、`label`
+- `/fusion classifier`：选择专用决策模型；`/fusion classifier list` 列出可用决策模型链
+- `/fusion classifier <auto|provider/model>`：切换为自动发现或指定决策模型
+- `/fusion classifier endpoint <baseUrl|clear>`：配置或清除自定义决策端点
+- `/fusion classifier import`：导入全局分类器端点设置
 - `/fusion health [reset [provider/model]]`：查看或重置模型冷却记录
 - `/fusion mode <auto|observe|on|off>`：切换运行模式或启停路由
 - `/fusion enable` / `/fusion disable`：启用或停用动态路由

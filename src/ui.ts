@@ -2,7 +2,8 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { STATUS_BAR_KEY } from "./constants.ts";
-import type { FusionRouteState, FusionRouterConfig, RouteTrigger } from "./types.ts";
+import { parseModelKey } from "./config.ts";
+import type { FusionRouteState, FusionRouterConfig, PartialFusionRouterConfig, RouteTrigger } from "./types.ts";
 
 /** 更新状态栏中的路由器状态 */
 export function updateRouterStatusBar(
@@ -38,12 +39,14 @@ export function updateRouterStatusBar(
 	}
 
 	const modePrefix = config.mode === "observe" ? "Fusion [观察]" : "Fusion";
-	const summary = `${modePrefix}: ${state.selectedModel} (${state.thinkingLevel})`;
+	const modelLabel = parseModelKey(state.selectedModel)?.id ?? state.selectedModel;
+	const summary = `${modePrefix}: ${modelLabel} • ${state.thinkingLevel}`;
 	if (state.lastDecision.trigger === "failover") {
-		ctx.ui.setStatus(STATUS_BAR_KEY, theme.fg("warning", summary));
+		ctx.ui.setStatus(STATUS_BAR_KEY, theme.fg("warning", `${summary} [故障转移]`));
 		return;
 	}
-	ctx.ui.setStatus(STATUS_BAR_KEY, theme.fg("accent", summary));
+	const stickyMark = state.lastDecision.trigger === "sticky_hold" ? " (保持)" : "";
+	ctx.ui.setStatus(STATUS_BAR_KEY, theme.fg("accent", `${summary}${stickyMark}`));
 }
 
 /** 根据配置决定是否弹出切换或故障转移通知 */
@@ -79,9 +82,24 @@ export function notifyRouteTransition(
 
 export interface ConfigPanelCallbacks {
 	getConfig: () => FusionRouterConfig;
-	getAvailableClassifierProviders: () => Promise<string[]>;
+	/** 可用专用决策分类器的 provider/model 列表 */
+	getAvailableClassifiers: () => Promise<string[]>;
 	getSaveScope: () => "global" | "project";
-	onApplyPatch: (patch: Partial<FusionRouterConfig>, scope: "global" | "project") => FusionRouterConfig;
+	getLastState: () => FusionRouteState | undefined;
+	onApplyPatch: (patch: PartialFusionRouterConfig, scope: "global" | "project") => FusionRouterConfig;
+}
+
+/** 决策分类器选择项的展示值 */
+export function formatClassifierChoice(config: FusionRouterConfig): string {
+	return config.classifier.provider === "auto" ? "auto" : `${config.classifier.provider}/${config.classifier.model}`;
+}
+
+/** 将决策分类器选择项转换为配置补丁；无法解析时返回 undefined */
+export function classifierChoiceToPatch(choice: string): PartialFusionRouterConfig | undefined {
+	if (choice === "auto") return { classifier: { provider: "auto" } };
+	const parsed = parseModelKey(choice);
+	if (!parsed) return undefined;
+	return { classifier: { provider: parsed.provider, model: parsed.id } };
 }
 
 /** 打开交互式 TUI 配置面板 */
@@ -92,8 +110,8 @@ export async function openFusionSettingsPanel(
 	if (!ctx.hasUI) return;
 
 	const initial = callbacks.getConfig();
-	const providers = await callbacks.getAvailableClassifierProviders();
-	const classifierChoices = Array.from(new Set(["auto", initial.classifier.provider, ...providers]));
+	const classifiers = await callbacks.getAvailableClassifiers();
+	const classifierChoices = Array.from(new Set(["auto", formatClassifierChoice(initial), ...classifiers]));
 	let activeScope: "global" | "project" = callbacks.getSaveScope();
 
 	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
@@ -125,10 +143,10 @@ export async function openFusionSettingsPanel(
 				values: ["auto", "observe"],
 			},
 			{
-				id: "classifierProvider",
-				label: "决策分类器提供商",
-				description: "选择专用决策模型提供商，auto 按内置优先级自动发现",
-				currentValue: cfg.classifier.provider,
+				id: "classifier",
+				label: "决策分类器",
+				description: "选择专用决策模型，auto 按内置优先级自动发现",
+				currentValue: formatClassifierChoice(cfg),
 				values: classifierChoices,
 			},
 			{
@@ -187,7 +205,6 @@ export async function openFusionSettingsPanel(
 			10,
 			getSettingsListTheme(),
 			(id, newValue) => {
-				const current = callbacks.getConfig();
 				const toBool = (v: string): boolean => v === "开启";
 
 				if (id === "saveScope") {
@@ -197,58 +214,49 @@ export async function openFusionSettingsPanel(
 					return;
 				}
 
-				let updated = current;
+				let patch: PartialFusionRouterConfig | undefined;
 				switch (id) {
 					case "enabled":
-						updated = callbacks.onApplyPatch({ enabled: toBool(newValue) }, activeScope);
+						patch = { enabled: toBool(newValue) };
 						break;
 					case "mode":
-						updated = callbacks.onApplyPatch({ mode: newValue as FusionRouterConfig["mode"] }, activeScope);
+						patch = { mode: newValue as FusionRouterConfig["mode"] };
 						break;
-					case "classifierProvider":
-						updated = callbacks.onApplyPatch(
-							{ classifier: { ...current.classifier, provider: newValue } },
-							activeScope,
-						);
+					case "classifier":
+						patch = classifierChoiceToPatch(newValue);
 						break;
 					case "thinkingMode":
-						updated = callbacks.onApplyPatch(
-							{ thinkingMode: newValue as FusionRouterConfig["thinkingMode"] },
-							activeScope,
-						);
+						patch = { thinkingMode: newValue as FusionRouterConfig["thinkingMode"] };
 						break;
 					case "stickyDuringToolLoop":
-						updated = callbacks.onApplyPatch(
-							{ redecision: { ...current.redecision, stickyDuringToolLoop: toBool(newValue) } },
-							activeScope,
-						);
+						patch = { redecision: { stickyDuringToolLoop: toBool(newValue) } };
 						break;
 					case "autoFailover":
-						updated = callbacks.onApplyPatch(
-							{ health: { ...current.health, autoFailover: toBool(newValue) } },
-							activeScope,
-						);
+						patch = { health: { autoFailover: toBool(newValue) } };
 						break;
 					case "showStatusBar":
-						updated = callbacks.onApplyPatch(
-							{ ui: { ...current.ui, showStatusBar: toBool(newValue) } },
-							activeScope,
-						);
+						patch = { ui: { showStatusBar: toBool(newValue) } };
 						break;
 					case "notifyOnSwitch":
-						updated = callbacks.onApplyPatch(
-							{ ui: { ...current.ui, notifyOnSwitch: toBool(newValue) } },
-							activeScope,
-						);
+						patch = { ui: { notifyOnSwitch: toBool(newValue) } };
 						break;
 					case "notifyOnFailover":
-						updated = callbacks.onApplyPatch(
-							{ ui: { ...current.ui, notifyOnFailover: toBool(newValue) } },
-							activeScope,
-						);
+						patch = { ui: { notifyOnFailover: toBool(newValue) } };
 						break;
 				}
-				updateRouterStatusBar(ctx, updated);
+				if (!patch) return;
+
+				try {
+					const updated = callbacks.onApplyPatch(patch, activeScope);
+					updateRouterStatusBar(ctx, updated, callbacks.getLastState());
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`保存配置失败：${message}`, "error");
+					const current = callbacks.getConfig();
+					for (const item of buildItems(current)) {
+						settingsList.updateValue(item.id, item.currentValue);
+					}
+				}
 				tui.requestRender();
 			},
 			() => {

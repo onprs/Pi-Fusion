@@ -26,6 +26,23 @@ describe("health 模型健康管理", () => {
 		assert.equal(overflow.shouldCooldown, false);
 	});
 
+	it("未知错误仅在 Pi 判定为可重试的上游故障时冷却", () => {
+		const transient = classifyModelFailure("error", "Provider returned error");
+		assert.equal(transient.category, "unknown");
+		assert.equal(transient.shouldCooldown, true);
+		assert.equal(transient.shouldFailover, true);
+
+		const deterministic = classifyModelFailure("error", "Invalid tool schema: missing required property");
+		assert.equal(deterministic.category, "unknown");
+		assert.equal(deterministic.shouldCooldown, false);
+		assert.equal(deterministic.shouldFailover, false);
+
+		const tracker = new ModelHealthTracker();
+		const result = tracker.reportFailure("openai/gpt-5", "error", "Invalid tool schema", POLICY);
+		assert.equal(result.recorded, false);
+		assert.equal(tracker.isAvailable("openai/gpt-5", POLICY), true);
+	});
+
 	it("支持 1500ms 防抖去重与指数退避冷却", () => {
 		let now = 1_000_000;
 		const tracker = new ModelHealthTracker(() => now);

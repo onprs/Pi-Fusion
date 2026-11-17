@@ -335,6 +335,20 @@ function normalizeCandidateProfile(raw: unknown, index: number, warnings: string
 	};
 }
 
+const PROFILE_OVERRIDE_FIELDS = [
+	"label",
+	"enabled",
+	"priority",
+	"costTier",
+	"specialty",
+	"avoid",
+	"defaultThinking",
+	"effortMap",
+	"contextWindow",
+	"maxTokens",
+] as const satisfies readonly (keyof CandidateModelProfile)[];
+
+/** 按 provider/id 合并候选模型：已存在的模型只覆盖补丁中显式提供的字段 */
 function mergeCandidateArrays(
 	base: CandidateModelProfile[],
 	override: unknown[],
@@ -346,14 +360,25 @@ function mergeCandidateArrays(
 	}
 	const seenOverride = new Set<string>();
 	for (let i = 0; i < override.length; i++) {
-		const normalized = normalizeCandidateProfile(override[i], i, warnings);
+		const rawEntry = override[i];
+		const normalized = normalizeCandidateProfile(rawEntry, i, warnings);
 		if (!normalized) continue;
 		const key = modelKey(normalized.provider, normalized.id);
 		if (seenOverride.has(key)) {
 			warnings.push(`候选模型 "${key}" 重复定义，已保留后者`);
 		}
 		seenOverride.add(key);
-		merged.set(key, normalized);
+		const existing = merged.get(key);
+		if (existing && isPlainObject(rawEntry)) {
+			const combined: CandidateModelProfile = { ...existing };
+			const target = combined as unknown as Record<string, unknown>;
+			for (const field of PROFILE_OVERRIDE_FIELDS) {
+				if (Object.hasOwn(rawEntry, field)) target[field] = normalized[field];
+			}
+			merged.set(key, combined);
+		} else {
+			merged.set(key, normalized);
+		}
 	}
 	const result = Array.from(merged.values());
 	if (result.length > MAX_CONFIGURED_CANDIDATES) {
@@ -439,7 +464,9 @@ export function mergeAndValidateConfig(
 			}
 			next.classifier.minConfidence = clamped;
 		}
-		if (isPlainObject(cl.customEndpoint)) {
+		if (cl.customEndpoint === null) {
+			next.classifier.customEndpoint = undefined;
+		} else if (isPlainObject(cl.customEndpoint)) {
 			const ep = cl.customEndpoint as Record<string, unknown>;
 			const endpoint: ClassifierCustomEndpointConfig = {
 				...(next.classifier.customEndpoint ?? {}),
@@ -629,26 +656,12 @@ export function loadFusionRouterConfig(options?: {
 }
 
 /**
- * 原子写入配置文件（先写临时文件再 rename，保证跨平台与崩溃安全）
+ * 原子写入 JSON 文件（先写临时文件再 rename，保证跨平台与崩溃安全）
  */
-export function saveFusionRouterConfig(
-	config: FusionRouterConfig,
-	options?: {
-		scope?: "global" | "project";
-		cwd?: string;
-		agentDir?: string;
-	},
-): string {
-	const scope = options?.scope ?? "global";
-	const targetPath = scope === "project"
-		? getProjectConfigPath(options?.cwd ?? process.cwd())
-		: getGlobalConfigPath(options?.agentDir);
-
-	const parentDir = dirname(targetPath);
-	mkdirSync(parentDir, { recursive: true });
-
+function writeJsonFileAtomic(targetPath: string, data: unknown): void {
+	mkdirSync(dirname(targetPath), { recursive: true });
 	const tempPath = `${targetPath}.${process.pid}.${Date.now()}.tmp`;
-	const serialized = `${JSON.stringify(config, null, 2)}\n`;
+	const serialized = `${JSON.stringify(data, null, 2)}\n`;
 	try {
 		writeFileSync(tempPath, serialized, "utf8");
 		renameSync(tempPath, targetPath);
@@ -660,5 +673,109 @@ export function saveFusionRouterConfig(
 		}
 		throw error;
 	}
+}
+
+function resolveScopePath(options?: { scope?: "global" | "project"; cwd?: string; agentDir?: string }): string {
+	return (options?.scope ?? "global") === "project"
+		? getProjectConfigPath(options?.cwd ?? process.cwd())
+		: getGlobalConfigPath(options?.agentDir);
+}
+
+/**
+ * 将完整配置原子写入指定层级文件（覆盖该文件全部内容）
+ */
+export function saveFusionRouterConfig(
+	config: FusionRouterConfig,
+	options?: {
+		scope?: "global" | "project";
+		cwd?: string;
+		agentDir?: string;
+	},
+): string {
+	const targetPath = resolveScopePath(options);
+	writeJsonFileAtomic(targetPath, config);
+	return targetPath;
+}
+
+function rawModelKey(entry: Record<string, unknown>): string | undefined {
+	const provider = typeof entry.provider === "string" ? entry.provider.trim() : "";
+	const id = typeof entry.id === "string" ? entry.id.trim() : "";
+	if (provider && id) return modelKey(provider, id);
+	if (typeof entry.key === "string") {
+		const parsed = parseModelKey(entry.key);
+		if (parsed) return modelKey(parsed.provider, parsed.id);
+	}
+	return undefined;
+}
+
+function mergeRawModels(existing: unknown, patchModels: readonly unknown[]): unknown[] {
+	const list: unknown[] = Array.isArray(existing)
+		? existing.map((entry) => (isPlainObject(entry) ? { ...entry } : entry))
+		: [];
+	for (const item of patchModels) {
+		if (!isPlainObject(item)) continue;
+		const key = rawModelKey(item);
+		if (!key) continue;
+		const index = list.findIndex((entry) => isPlainObject(entry) && rawModelKey(entry) === key);
+		if (index >= 0) {
+			list[index] = mergeRawLayer(list[index] as Record<string, unknown>, item);
+		} else {
+			list.push(structuredClone(item));
+		}
+	}
+	return list;
+}
+
+/** 将补丁深度合并到单层原始配置：对象递归合并，models 按 provider/id 合并，其余数组与标量整体替换 */
+function mergeRawLayer(target: Record<string, unknown>, patch: Record<string, unknown>): Record<string, unknown> {
+	const result: Record<string, unknown> = { ...target };
+	for (const [key, value] of Object.entries(patch)) {
+		if (value === undefined) continue;
+		if (key === "models" && Array.isArray(value)) {
+			result.models = mergeRawModels(result.models, value);
+		} else if (isPlainObject(value) && isPlainObject(result[key])) {
+			result[key] = mergeRawLayer(result[key] as Record<string, unknown>, value);
+		} else {
+			result[key] = structuredClone(value);
+		}
+	}
+	return result;
+}
+
+/** 读取单层配置文件的原始对象；旧版三档格式会先转换为当前格式 */
+function readConfigLayer(filePath: string): Record<string, unknown> {
+	if (!existsSync(filePath)) return {};
+	const content = readFileSync(filePath, "utf8");
+	if (!content.trim()) return {};
+	let data: unknown;
+	try {
+		data = JSON.parse(content);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		throw new Error(`配置文件不是有效的 JSON，请先修复后再保存 (${filePath}): ${message}`);
+	}
+	if (!isPlainObject(data)) {
+		throw new Error(`配置文件根节点不是对象，请先修复后再保存 (${filePath})`);
+	}
+	const { patch, migratedFrom } = migrateLegacyConfig(data);
+	return migratedFrom ? (patch as Record<string, unknown>) : data;
+}
+
+/**
+ * 仅将补丁合并写入指定层级的配置文件，保留该文件原有内容，不写入其他层级的合并结果
+ */
+export function saveConfigPatchToLayer(
+	patch: PartialFusionRouterConfig,
+	options?: {
+		scope?: "global" | "project";
+		cwd?: string;
+		agentDir?: string;
+	},
+): string {
+	const targetPath = resolveScopePath(options);
+	const layer = readConfigLayer(targetPath);
+	const next = mergeRawLayer(layer, patch as Record<string, unknown>);
+	if (next.version === undefined) next.version = 1;
+	writeJsonFileAtomic(targetPath, next);
 	return targetPath;
 }

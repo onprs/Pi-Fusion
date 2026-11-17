@@ -128,6 +128,13 @@ export interface FusionRouterConfig {
 	ui: UIConfig;
 }
 
+/** 候选模型局部补丁：provider 与 id 必填，其余字段仅覆盖显式提供的部分；defaultThinking 为 null 时清除 */
+export type CandidateModelPatch = Omit<Partial<CandidateModelProfile>, "defaultThinking"> & {
+	provider: string;
+	id: string;
+	defaultThinking?: ModelThinkingLevel | null;
+};
+
 /** 允许局部覆盖的深度配置补丁 */
 export type PartialFusionRouterConfig = {
 	version?: number;
@@ -135,10 +142,11 @@ export type PartialFusionRouterConfig = {
 	mode?: FusionRouterMode;
 	virtualModel?: Partial<VirtualModelConfig>;
 	classifier?: Partial<Omit<ClassifierConfig, "customEndpoint" | "fallbackChain">> & {
-		customEndpoint?: Partial<ClassifierCustomEndpointConfig>;
+		/** 设为 null 时清除自定义端点 */
+		customEndpoint?: Partial<ClassifierCustomEndpointConfig> | null;
 		fallbackChain?: ClassifierRef[];
 	};
-	models?: CandidateModelProfile[];
+	models?: CandidateModelPatch[];
 	defaultModel?: string;
 	fallbackChain?: string[];
 	efforts?: Record<string, string>;

@@ -55,7 +55,7 @@ export function enrichCandidateProfile(
 }
 
 /** 判断模型是否为 Pi 虚拟模型 */
-function isVirtualCatalogModel(model: Pick<Model<Api>, "api">): boolean {
+export function isVirtualCatalogModel(model: Pick<Model<Api>, "api">): boolean {
 	return model.api === "pi-virtual";
 }
 

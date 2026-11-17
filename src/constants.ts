@@ -43,6 +43,12 @@ export const MAX_CLASSIFIER_TIMEOUT_MS = 15000;
 /** 健康冷却防抖窗口（毫秒） */
 export const HEALTH_DEBOUNCE_MS = 1500;
 
+/** 自定义决策端点未指定密钥变量时依次尝试的环境变量 */
+export const CLASSIFIER_API_KEY_ENV_FALLBACKS: readonly string[] = ["CLASSIFIER_API_KEY", "TYPESAFE_API_KEY"];
+
+/** 自定义决策端点默认注册的提供商 ID */
+export const DEFAULT_CUSTOM_CLASSIFIER_PROVIDER_ID = "fusion-classifier";
+
 /** 内置自动发现专用分类器优先级列表 */
 export const AUTO_CLASSIFIER_PRECEDENCE: readonly string[] = [
 	"typesafe/jev-latest",

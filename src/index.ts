@@ -6,11 +6,11 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { registerCustomClassifierEndpoint } from "./classifier.ts";
 import { registerFusionCommands } from "./commands.ts";
-import { loadFusionRouterConfig, mergeAndValidateConfig, modelKey, saveFusionRouterConfig } from "./config.ts";
+import { loadFusionRouterConfig, modelKey, saveConfigPatchToLayer } from "./config.ts";
 import { DEFAULT_VIRTUAL_THINKING_LEVELS } from "./constants.ts";
 import { ModelHealthTracker } from "./health.ts";
 import { routeRequest } from "./router.ts";
-import type { FusionRouteState, FusionRouterConfig, LoadedConfigResult } from "./types.ts";
+import type { FusionRouteState, FusionRouterConfig, LoadedConfigResult, PartialFusionRouterConfig } from "./types.ts";
 import { notifyRouteTransition, updateRouterStatusBar } from "./ui.ts";
 
 /** 从当前会话分支恢复虚拟模型的最新路由状态 */
@@ -37,9 +37,19 @@ export default function (pi: ExtensionAPI): void {
 	let currentCwd = process.cwd();
 	const healthTracker = new ModelHealthTracker();
 	let lastState: FusionRouteState | undefined;
+	let registeredClassifierProviderId: string | undefined;
+
+	/** 同步自定义决策端点：端点被移除或更换提供商 ID 时注销旧的注册 */
+	const syncCustomClassifierEndpoint = (cfg: FusionRouterConfig): void => {
+		const registered = registerCustomClassifierEndpoint(pi, cfg);
+		if (registeredClassifierProviderId && registeredClassifierProviderId !== registered?.providerId) {
+			pi.unregisterProvider(registeredClassifierProviderId);
+		}
+		registeredClassifierProviderId = registered?.providerId;
+	};
 
 	const registerVirtualModelFromConfig = (cfg: FusionRouterConfig): void => {
-		registerCustomClassifierEndpoint(pi, cfg);
+		syncCustomClassifierEndpoint(cfg);
 		pi.registerVirtualModel<FusionRouteState>({
 			provider: cfg.virtualModel.provider,
 			id: cfg.virtualModel.id,
@@ -89,24 +99,14 @@ export default function (pi: ExtensionAPI): void {
 	};
 
 	const updateAndSaveConfig = (
-		patch: Partial<FusionRouterConfig>,
+		patch: PartialFusionRouterConfig,
 		scope?: "global" | "project",
 	): { config: FusionRouterConfig; savedPath: string } => {
-		const prevVirtual = loadedConfig.config.virtualModel;
-		const { config } = mergeAndValidateConfig(loadedConfig.config, patch);
 		const targetScope = scope ?? (loadedConfig.projectExists ? "project" : "global");
-		const savedPath = saveFusionRouterConfig(config, { scope: targetScope, cwd: currentCwd });
-		loadedConfig = {
-			...loadedConfig,
-			config,
-			globalExists: targetScope === "global" ? true : loadedConfig.globalExists,
-			projectExists: targetScope === "project" ? true : loadedConfig.projectExists,
-		};
-		if (prevVirtual.provider !== config.virtualModel.provider || prevVirtual.id !== config.virtualModel.id) {
-			pi.unregisterVirtualModel(prevVirtual.provider, prevVirtual.id);
-		}
-		registerVirtualModelFromConfig(config);
-		return { config, savedPath };
+		// 仅写入目标层级文件，再按全局 < 项目的顺序重新加载，避免两层配置互相渗透
+		const savedPath = saveConfigPatchToLayer(patch, { scope: targetScope, cwd: currentCwd });
+		const loaded = reloadConfigForCwd();
+		return { config: loaded.config, savedPath };
 	};
 
 	// 初次加载时注册虚拟模型（满足 --list-models 等离线/无会话命令）

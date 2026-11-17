@@ -26,7 +26,9 @@ export interface ClassifierRunnerRegistry {
 import { getGlobalAgentDir, modelKey } from "./config.ts";
 import {
 	AUTO_CLASSIFIER_PRECEDENCE,
+	CLASSIFIER_API_KEY_ENV_FALLBACKS,
 	CLASSIFIER_ID_ALIASES,
+	DEFAULT_CUSTOM_CLASSIFIER_PROVIDER_ID,
 	MAX_CLASSIFIER_CONTEXT_ITEMS,
 	MAX_CLASSIFIER_ITEM_CHARS,
 	MAX_CLASSIFIER_REQUEST_CHARS,
@@ -74,38 +76,68 @@ export function readPiClassifierEndpointHints(agentDir?: string): {
 	}
 }
 
+/** 自定义决策端点解析结果 */
+export interface CustomClassifierTarget {
+	providerId: string;
+	modelId: string;
+	baseUrl: string;
+	api: SupportedClassifierApi;
+}
+
+/** 解析自定义决策端点的提供商、模型与地址；未配置或缺少地址时返回 undefined */
+export function resolveCustomClassifierTarget(
+	classifierConfig: ClassifierConfig,
+	agentDir?: string,
+): CustomClassifierTarget | undefined {
+	const custom: ClassifierCustomEndpointConfig | undefined = classifierConfig.customEndpoint;
+	if (!custom) return undefined;
+
+	let baseUrl = custom.baseUrl?.trim();
+	let modelId = classifierConfig.model?.trim() || "jev-latest";
+
+	if (custom.importFromPiClassifier) {
+		const hints = readPiClassifierEndpointHints(agentDir);
+		if (!baseUrl && hints.baseUrl) baseUrl = hints.baseUrl;
+		if ((!classifierConfig.model || classifierConfig.model === "jev-latest") && hints.model) {
+			modelId = hints.model;
+		}
+	}
+
+	if (!baseUrl) return undefined;
+	return {
+		providerId: custom.providerId?.trim() || DEFAULT_CUSTOM_CLASSIFIER_PROVIDER_ID,
+		modelId,
+		baseUrl: baseUrl.replace(/\/+$/, ""),
+		api: custom.api ?? "typesafe-system-one",
+	};
+}
+
+/** 解析自定义端点的密钥引用：优先使用配置的变量名，其次使用已设置的通用变量 */
+export function resolveClassifierApiKeyReference(
+	custom: ClassifierCustomEndpointConfig,
+	env: NodeJS.ProcessEnv = process.env,
+): string {
+	const explicit = custom.apiKeyEnv?.trim().replace(/^\$/, "");
+	if (explicit) return `$${explicit}`;
+	const present = CLASSIFIER_API_KEY_ENV_FALLBACKS.find((name) => env[name]?.trim());
+	return `$${present ?? CLASSIFIER_API_KEY_ENV_FALLBACKS[0]}`;
+}
+
 /** 根据自定义端点配置注册专用的 Classifier Provider（仅在用户显式配置 customEndpoint 时调用） */
 export function registerCustomClassifierEndpoint(
 	pi: Pick<ExtensionAPI, "registerProvider">,
 	config: FusionRouterConfig,
 	agentDir?: string,
 ): { providerId: string; modelId: string } | undefined {
-	const custom: ClassifierCustomEndpointConfig | undefined = config.classifier.customEndpoint;
-	if (!custom) return undefined;
+	const custom = config.classifier.customEndpoint;
+	const target = resolveCustomClassifierTarget(config.classifier, agentDir);
+	if (!custom || !target) return undefined;
 
-	let baseUrl = custom.baseUrl?.trim();
-	let modelId = config.classifier.model?.trim() || "jev-latest";
-
-	if (custom.importFromPiClassifier) {
-		const hints = readPiClassifierEndpointHints(agentDir);
-		if (!baseUrl && hints.baseUrl) baseUrl = hints.baseUrl;
-		if ((!config.classifier.model || config.classifier.model === "jev-latest") && hints.model) {
-			modelId = hints.model;
-		}
-	}
-
-	if (!baseUrl) return undefined;
-
-	const providerId = custom.providerId?.trim() || "fusion-classifier";
-	const api: SupportedClassifierApi = custom.api ?? "typesafe-system-one";
-	const apiKeyRef = custom.apiKeyEnv?.trim()
-		? `$${custom.apiKeyEnv.trim().replace(/^\$/, "")}`
-		: "$CLASSIFIER_API_KEY";
-
+	const { providerId, modelId, baseUrl, api } = target;
 	pi.registerProvider(providerId, {
 		name: "Fusion Classifier Endpoint",
-		baseUrl: baseUrl.replace(/\/+$/, ""),
-		apiKey: apiKeyRef,
+		baseUrl,
+		apiKey: resolveClassifierApiKeyReference(custom),
 		authHeader: true,
 		models: [
 			{
@@ -137,6 +169,7 @@ function resolveClassifierLookup(
 export async function resolveClassifierChain(
 	modelRegistry: ClassifierLookupRegistry,
 	classifierConfig: ClassifierConfig,
+	agentDir?: string,
 ): Promise<DiscoveredClassifier[]> {
 	const available = await modelRegistry.getAvailableOfType("classifier");
 	const availableMap = new Map<string, ClassifierModel<ClassifierApi>>();
@@ -168,15 +201,17 @@ export async function resolveClassifierChain(
 		}
 	};
 
-	// 1. 显式配置的主分类器
-	if (classifierConfig.provider !== "auto") {
-		const targetProvider = classifierConfig.customEndpoint?.providerId?.trim() && classifierConfig.provider === "custom"
-			? classifierConfig.customEndpoint.providerId.trim()
-			: classifierConfig.provider;
-		pushIfAvailable(targetProvider, classifierConfig.model, classifierConfig.customEndpoint ? "custom" : "registry");
-	} else if (classifierConfig.customEndpoint?.baseUrl) {
-		const customProvider = classifierConfig.customEndpoint.providerId?.trim() || "fusion-classifier";
-		pushIfAvailable(customProvider, classifierConfig.model, "custom");
+	// 1. 自定义端点与显式配置的主分类器
+	const customTarget = resolveCustomClassifierTarget(classifierConfig, agentDir);
+	const configuredProvider = classifierConfig.provider;
+	if (
+		customTarget
+		&& (configuredProvider === "auto" || configuredProvider === "custom" || configuredProvider === customTarget.providerId)
+	) {
+		pushIfAvailable(customTarget.providerId, customTarget.modelId, "custom");
+	}
+	if (configuredProvider !== "auto" && configuredProvider !== "custom") {
+		pushIfAvailable(configuredProvider, classifierConfig.model, "registry");
 	}
 
 	// 2. 配置的备用分类器链
