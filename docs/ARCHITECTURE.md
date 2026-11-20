@@ -23,8 +23,8 @@ Pi-Fusion 通过 `pi.registerVirtualModel` 注册虚拟模型（默认 `router/f
 | `src/classifier.ts` | 分类器链解析、自定义端点注册、紧凑摘要构造、响应校验、超时与备用链 |
 | `src/policy.ts` | 轮次步数与连续工具错误统计、Thinking 签名保护、周期复查、切换收益门控 |
 | `src/router.ts` | `direct` / `retry` / `continuation` / `user` 四分支路由状态机 |
-| `src/ui.ts` | 状态栏、切换通知、`openTabbedSplitWorkspace` 横向分区双栏工作台（窄屏自动上下排布）、`selectMenuPanel` 与 3 分区设置面板 |
-| `src/commands.ts` | `/fusion`（`/router`）4 分区双栏控制中心、全部子命令及模型/分类器/健康/干跑测试双栏交互视图 |
+| `src/ui.ts` | 状态栏、切换通知、`openTabbedSplitWorkspace` 固定高度横向分区双栏工作台（锚定视口滚动、结构化键值详情卡片、窄屏固定高度上下布局）、`selectMenuPanel` 与 3 分区设置面板 |
+| `src/commands.ts` | `/fusion`（`/router`）4 分区固定高度双栏控制中心、全部子命令及模型/分类器/健康/干跑测试固定列表双栏交互视图 |
 | `src/index.ts` | 扩展入口：加载配置、注册虚拟模型与自定义分类器端点、绑定事件与命令 |
 
 ## 配置系统

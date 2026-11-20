@@ -88,21 +88,44 @@ export function notifyRouteTransition(
 	}
 }
 
-// ───────────────────────── 横向分区双栏工作台组件 ─────────────────────────
+// ───────────────────────── 固定高度双栏工作台组件 ─────────────────────────
 
-/** 面板双栏自适应阈值：达到该列宽时启用左右分栏，窄窗口自动退化为上下紧凑分区 */
+/** 双栏自适应列宽阈值：达到该宽度使用左右分栏，以下退化为固定高度上下布局 */
 const SPLIT_LAYOUT_MIN_WIDTH = 72;
-const MAX_LEFT_VISIBLE_ROWS = 10;
-const MAX_RIGHT_VISIBLE_ROWS = 16;
+/** 宽屏主体固定行数（左栏列表与右栏详情共同严格锁定该高度） */
+const DEFAULT_SPLIT_BODY_ROWS = 10;
+/** 窄屏列表区与详情区固定行数，避免移动光标或切换分区时界面跳动 */
+const NARROW_LIST_ROWS = 7;
+const NARROW_DETAIL_ROWS = 5;
+
+export type DetailTone = "accent" | "success" | "warning" | "error" | "text" | "muted" | "dim";
+
+export interface SummarySegment {
+	label: string;
+	value: string;
+	tone?: DetailTone;
+}
+
+export type DetailEntry =
+	| { kind: "kv"; key: string; value: string; tone?: DetailTone }
+	| { kind: "text"; text: string; tone?: DetailTone }
+	| { kind: "heading"; text: string }
+	| { kind: "bullet"; label: string; value?: string; tone?: DetailTone }
+	| { kind: "hint"; text: string }
+	| { kind: "spacer" };
 
 export interface WorkspaceItem {
 	id: string;
 	label: string;
-	/** 左栏右侧对齐显示的当前值摘要 */
+	/** 左栏右侧对齐显示的当前值或简短状态 */
 	value?: string;
+	/** 左栏右侧值的语义色调 */
+	valueTone?: DetailTone;
 	/** 光标选中该项时右栏显示的标题 */
 	detailTitle?: string;
-	/** 光标选中该项时右栏显示的多行内容 */
+	/** 结构化右栏详情条目（优先于 detailLines） */
+	detailEntries?: DetailEntry[];
+	/** 纯文本右栏详情行（兼容简单场景） */
 	detailLines?: string[];
 	/** 是否允许按空格键触发（适合布尔与枚举切换项） */
 	allowSpace?: boolean;
@@ -116,22 +139,33 @@ export interface WorkspaceSection {
 	items: WorkspaceItem[];
 	/** 该分区默认的右栏标题 */
 	detailTitle?: string;
-	/** 该分区默认的右栏多行内容 */
+	/** 该分区默认的结构化右栏详情 */
+	detailEntries?: DetailEntry[];
+	/** 该分区默认的纯文本右栏详情 */
 	detailLines?: string[];
 }
 
 export interface WorkspaceViewSpec {
 	title: string;
-	/** 顶栏标题行右侧对齐显示的摘要徽章 */
+	/** 顶栏标题行右侧对齐显示的状态徽章 */
+	headerBadge?: { text: string; tone?: DetailTone };
+	/** 顶栏标题行右侧纯文本摘要（向后兼容） */
 	headerRight?: string;
-	/** 顶栏横向状态摘要条（宽屏单行并排，窄屏自动折行对齐） */
-	bannerLines?: string[];
+	/** 顶栏固定单行关键指标条（永不折行） */
+	summarySegments?: SummarySegment[];
+	/** 宽屏主体固定行数（默认 10 行） */
+	bodyRows?: number;
 	sections: WorkspaceSection[];
 }
 
 interface ThemeLike {
-	fg: (color: "accent" | "muted" | "dim" | "warning" | "error" | "success" | "text", text: string) => string;
+	fg: (color: DetailTone, text: string) => string;
 	bold: (text: string) => string;
+}
+
+function applyTone(theme: ThemeLike, tone: DetailTone | undefined, text: string): string {
+	if (!tone || tone === "text") return theme.fg("text", text);
+	return theme.fg(tone, text);
 }
 
 function padRightVisible(text: string, targetWidth: number): string {
@@ -140,71 +174,242 @@ function padRightVisible(text: string, targetWidth: number): string {
 	return clipped + " ".repeat(pad);
 }
 
+/** 将结构化详情条目转换为纯文本，用于非 TUI 回退展示 */
+export function formatDetailEntriesPlain(entries: readonly DetailEntry[]): string[] {
+	const lines: string[] = [];
+	for (const entry of entries) {
+		switch (entry.kind) {
+			case "kv":
+				lines.push(`${entry.key}: ${entry.value}`);
+				break;
+			case "text":
+				lines.push(entry.text);
+				break;
+			case "heading":
+				lines.push(entry.text);
+				break;
+			case "bullet":
+				lines.push(entry.value ? `- ${entry.label} (${entry.value})` : `- ${entry.label}`);
+				break;
+			case "hint":
+				break;
+			case "spacer":
+				if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+				break;
+		}
+	}
+	while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+	return lines;
+}
+
+function renderSummaryLine(segments: readonly SummarySegment[], safeWidth: number, theme: ThemeLike): string {
+	const sep = theme.fg("dim", "  │  ");
+	const parts = segments.map((seg) => {
+		const k = theme.fg("dim", `${seg.label} `);
+		const v = applyTone(theme, seg.tone ?? "text", seg.value);
+		return `${k}${v}`;
+	});
+	return truncateToWidth(` ${parts.join(sep)}`, safeWidth, "…");
+}
+
 function renderLeftItemRow(
 	item: WorkspaceItem,
 	isSelected: boolean,
 	colWidth: number,
 	theme: ThemeLike,
 ): string {
-	const prefix = isSelected ? theme.fg("accent", "→ ") : "  ";
+	const prefix = isSelected ? theme.fg("accent", "▸ ") : "  ";
 	const innerWidth = Math.max(4, colWidth - 2);
 
 	if (!item.value) {
 		const rawLabel = truncateToWidth(item.label, innerWidth, "…");
-		const styled = isSelected ? theme.fg("accent", theme.bold(rawLabel)) : rawLabel;
+		const styled = isSelected ? theme.fg("accent", theme.bold(rawLabel)) : theme.fg("text", rawLabel);
 		return padRightVisible(prefix + styled, colWidth);
 	}
 
 	const minGap = 2;
-	const maxLabelW = Math.max(6, Math.min(visibleWidth(item.label), Math.floor(innerWidth * 0.68)));
-	const labelPart = truncateToWidth(item.label, maxLabelW, "…");
+	const valueBudget = Math.max(6, Math.floor(innerWidth * 0.44));
+	const clippedValue = truncateToWidth(item.value, valueBudget, "…");
+	const clippedValueW = visibleWidth(clippedValue);
+	const labelBudget = Math.max(6, innerWidth - clippedValueW - minGap);
+	const labelPart = truncateToWidth(item.label, labelBudget, "…");
 	const labelW = visibleWidth(labelPart);
 	const remainingForValue = Math.max(0, innerWidth - labelW - minGap);
 	const valuePart = remainingForValue > 0 ? truncateToWidth(item.value, remainingForValue, "…") : "";
 	const valueW = visibleWidth(valuePart);
 	const gapSpaces = " ".repeat(Math.max(1, innerWidth - labelW - valueW));
 
-	const styledLabel = isSelected ? theme.fg("accent", theme.bold(labelPart)) : labelPart;
-	const styledValue = isSelected ? theme.fg("accent", valuePart) : theme.fg("muted", valuePart);
+	const styledLabel = isSelected ? theme.fg("accent", theme.bold(labelPart)) : theme.fg("text", labelPart);
+	const valueTone = item.valueTone ?? "muted";
+	const styledValue = isSelected
+		? valueTone === "warning" || valueTone === "error" || valueTone === "success"
+			? theme.bold(applyTone(theme, valueTone, valuePart))
+			: theme.fg("accent", valuePart)
+		: applyTone(theme, valueTone, valuePart);
 	return padRightVisible(`${prefix}${styledLabel}${gapSpaces}${styledValue}`, colWidth);
 }
 
 function renderDetailColumn(
 	title: string | undefined,
-	rawLines: readonly string[],
+	entries: readonly DetailEntry[] | undefined,
+	fallbackLines: readonly string[] | undefined,
 	colWidth: number,
+	maxRows: number,
 	theme: ThemeLike,
 ): string[] {
-	const safeWidth = Math.max(10, colWidth);
-	const out: string[] = [];
-	if (title) {
-		out.push(truncateToWidth(theme.fg("accent", theme.bold(title)), safeWidth, "…"));
-	}
-	for (const raw of rawLines) {
-		for (const sub of raw.split("\n")) {
-			if (!sub.trim()) {
-				out.push("");
-				continue;
+	const safeWidth = Math.max(12, colWidth);
+	const body: string[] = [];
+
+	if (entries && entries.length > 0) {
+		const kvKeys = entries.filter((e): e is Extract<DetailEntry, { kind: "kv" }> => e.kind === "kv");
+		const maxKeyW = kvKeys.reduce((acc, e) => Math.max(acc, visibleWidth(e.key)), 0);
+		const keyColW = Math.min(12, maxKeyW);
+
+		for (const entry of entries) {
+			switch (entry.kind) {
+				case "spacer":
+					if (body.length > 0 && body[body.length - 1] !== "") body.push("");
+					break;
+				case "heading":
+					body.push(truncateToWidth(theme.fg("muted", theme.bold(entry.text)), safeWidth, "…"));
+					break;
+				case "hint":
+					body.push(truncateToWidth(theme.fg("dim", entry.text), safeWidth, "…"));
+					break;
+				case "text": {
+					for (const sub of entry.text.split("\n")) {
+						if (!sub.trim()) {
+							body.push("");
+							continue;
+						}
+						for (const wrapped of wrapTextWithAnsi(applyTone(theme, entry.tone ?? "muted", sub), safeWidth)) {
+							body.push(truncateToWidth(wrapped, safeWidth, "…"));
+						}
+					}
+					break;
+				}
+				case "kv": {
+					const clippedKey = truncateToWidth(entry.key, keyColW, "…");
+					const keyPad = " ".repeat(Math.max(0, keyColW - visibleWidth(clippedKey)));
+					const prefixText = `${theme.fg("dim", clippedKey)}${keyPad}  `;
+					const valWidth = Math.max(8, safeWidth - keyColW - 2);
+					const wrappedVals = wrapTextWithAnsi(applyTone(theme, entry.tone ?? "text", entry.value), valWidth);
+					const indent = " ".repeat(keyColW + 2);
+					wrappedVals.forEach((wLine, idx) => {
+						const line = idx === 0 ? `${prefixText}${wLine}` : `${indent}${wLine}`;
+						body.push(truncateToWidth(line, safeWidth, "…"));
+					});
+					break;
+				}
+				case "bullet": {
+					const dot = theme.fg("dim", "• ");
+					const innerW = Math.max(8, safeWidth - 2);
+					if (!entry.value) {
+						body.push(truncateToWidth(`${dot}${applyTone(theme, entry.tone ?? "text", entry.label)}`, safeWidth, "…"));
+					} else {
+						const valBudget = Math.max(6, Math.floor(innerW * 0.45));
+						const valPart = truncateToWidth(entry.value, valBudget, "…");
+						const labelBudget = Math.max(6, innerW - visibleWidth(valPart) - 2);
+						const labelPart = truncateToWidth(entry.label, labelBudget, "…");
+						const gap = " ".repeat(Math.max(1, innerW - visibleWidth(labelPart) - visibleWidth(valPart)));
+						body.push(
+							truncateToWidth(
+								`${dot}${theme.fg("text", labelPart)}${gap}${applyTone(theme, entry.tone ?? "muted", valPart)}`,
+								safeWidth,
+								"…",
+							),
+						);
+					}
+					break;
+				}
 			}
-			const wrapped = wrapTextWithAnsi(theme.fg("muted", sub), safeWidth);
-			for (const wLine of wrapped) {
-				out.push(truncateToWidth(wLine, safeWidth, "…"));
+		}
+	} else if (fallbackLines && fallbackLines.length > 0) {
+		for (const raw of fallbackLines) {
+			for (const sub of raw.split("\n")) {
+				if (!sub.trim()) {
+					body.push("");
+					continue;
+				}
+				for (const wLine of wrapTextWithAnsi(theme.fg("muted", sub), safeWidth)) {
+					body.push(truncateToWidth(wLine, safeWidth, "…"));
+				}
 			}
 		}
 	}
-	if (out.length > MAX_RIGHT_VISIBLE_ROWS) {
-		const omitted = out.length - (MAX_RIGHT_VISIBLE_ROWS - 1);
+
+	while (body.length > 0 && body[body.length - 1] === "") body.pop();
+
+	const out: string[] = [];
+	if (title) {
+		out.push(truncateToWidth(theme.fg("accent", theme.bold(title)), safeWidth, "…"));
+		if (body.length > 0 && body.length <= maxRows - 2) {
+			out.push("");
+		}
+	}
+	out.push(...body);
+
+	if (out.length > maxRows) {
+		const omitted = out.length - (maxRows - 1);
 		return [
-			...out.slice(0, MAX_RIGHT_VISIBLE_ROWS - 1),
+			...out.slice(0, maxRows - 1),
 			truncateToWidth(theme.fg("dim", `… 其余 ${omitted} 行`), safeWidth, "…"),
 		];
 	}
+
+	// 补齐空行以保证详情区高度恒定
+	while (out.length < maxRows) out.push("");
 	return out;
 }
 
+function renderTabBar(
+	sections: readonly WorkspaceSection[],
+	activeIndex: number,
+	safeWidth: number,
+	theme: ThemeLike,
+): { line: string; hitRanges: Array<{ startCol: number; endCol: number; index: number }> } {
+	const build = (compact: boolean) => {
+		const hitRanges: Array<{ startCol: number; endCol: number; index: number }> = [];
+		let line = " ";
+		let colCursor = 1;
+		let allFit = true;
+
+		for (let i = 0; i < sections.length; i++) {
+			const s = sections[i]!;
+			const isActive = i === activeIndex;
+			const rawTab = compact
+				? isActive
+					? `▸${i + 1}${s.title}`
+					: `${i + 1}${s.title}`
+				: isActive
+					? `▸ ${i + 1} ${s.title}`
+					: `  ${i + 1} ${s.title}`;
+			const sepRaw = compact ? " │ " : "  │  ";
+			const tabW = visibleWidth(rawTab);
+			if (colCursor + tabW > safeWidth - 1) {
+				allFit = false;
+				break;
+			}
+			hitRanges.push({ startCol: colCursor, endCol: colCursor + tabW, index: i });
+			line += isActive ? theme.fg("accent", theme.bold(rawTab)) : theme.fg("muted", rawTab);
+			colCursor += tabW;
+			if (i < sections.length - 1 && colCursor + visibleWidth(sepRaw) < safeWidth) {
+				line += theme.fg("dim", sepRaw);
+				colCursor += visibleWidth(sepRaw);
+			}
+		}
+		return { line: truncateToWidth(line, safeWidth, "…"), hitRanges, allFit };
+	};
+
+	const spacious = build(false);
+	if (spacious.allFit) return { line: spacious.line, hitRanges: spacious.hitRanges };
+	const compact = build(true);
+	return { line: compact.line, hitRanges: compact.hitRanges };
+}
+
 /**
- * 打开横向分区双栏工作台：
- * - TUI 模式下：顶部紧凑状态条 + 横向分区标签栏（多分区时） + 左右双栏（左栏操作项、右栏实时详情卡片），窄屏自动上下排布
+ * 打开固定高度的横向分区双栏工作台：
+ * - TUI 模式下：所有面板区域（顶栏、标签栏、列表区、详情区、底栏）均保持固定行数，切页与移动光标零跳动
  * - 非 TUI 交互模式下：自动回退至 ctx.ui.select 分区与操作列表
  */
 export async function openTabbedSplitWorkspace(
@@ -226,13 +431,28 @@ export async function openTabbedSplitWorkspace(
 			if (idx >= 0) currentSectionIdx = idx;
 		}
 
+		const formatSummaryPlain = (spec: WorkspaceViewSpec): string | undefined => {
+			if (!spec.summarySegments || spec.summarySegments.length === 0) return undefined;
+			return spec.summarySegments.map((s) => `${s.label}: ${s.value}`).join(" | ");
+		};
+
+		const extractDetailPlain = (
+			entries: readonly DetailEntry[] | undefined,
+			lines: readonly string[] | undefined,
+		): string[] => {
+			if (entries && entries.length > 0) return formatDetailEntriesPlain(entries);
+			return lines ? [...lines] : [];
+		};
+
 		// 单分区时直接展示该分区的项目列表；多分区时支持在分区列表与分区内操作列表之间切换
 		if (firstSpec.sections.length <= 1) {
 			for (;;) {
 				const spec = buildSpec();
 				const sec = spec.sections[0];
 				if (!sec || sec.items.length === 0) return;
-				const detailText = sec.detailLines?.join("\n") ?? spec.bannerLines?.join("\n");
+				const detailLines = extractDetailPlain(sec.detailEntries, sec.detailLines);
+				const summaryText = formatSummaryPlain(spec);
+				const detailText = detailLines.length > 0 ? detailLines.join("\n") : summaryText;
 				const header = detailText ? `${spec.title}\n${detailText}` : spec.title;
 				const labels = sec.items.map((item) => (item.value ? `${item.label}：${item.value}` : item.label));
 				const picked = await ctx.ui.select(header, labels);
@@ -247,8 +467,8 @@ export async function openTabbedSplitWorkspace(
 		for (;;) {
 			const spec = buildSpec();
 			if (spec.sections.length === 0) return;
-			const banner = spec.bannerLines?.join("\n");
-			const rootHeader = banner ? `${spec.title}\n${banner}` : spec.title;
+			const summaryText = formatSummaryPlain(spec);
+			const rootHeader = summaryText ? `${spec.title}\n${summaryText}` : spec.title;
 			const sectionLabels = spec.sections.map((sec) => `${sec.title}（${sec.items.length} 项）`);
 			const pickedSec = await ctx.ui.select(rootHeader, sectionLabels);
 			if (!pickedSec) return;
@@ -258,8 +478,12 @@ export async function openTabbedSplitWorkspace(
 				const innerSpec = buildSpec();
 				const sec = innerSpec.sections[currentSectionIdx];
 				if (!sec) break;
-				const detailLines = sec.items[0]?.detailLines ?? sec.detailLines;
-				const secHeader = detailLines && detailLines.length > 0
+				const firstItem = sec.items[0];
+				const detailLines = extractDetailPlain(
+					firstItem?.detailEntries ?? sec.detailEntries,
+					firstItem?.detailLines ?? sec.detailLines,
+				);
+				const secHeader = detailLines.length > 0
 					? `${innerSpec.title} — ${sec.title}\n${detailLines.join("\n")}`
 					: `${innerSpec.title} — ${sec.title}`;
 				const backLabel = "返回分区列表";
@@ -283,6 +507,7 @@ export async function openTabbedSplitWorkspace(
 				if (foundSec >= 0) sectionIndex = foundSec;
 			}
 			const selectedBySection = new Map<string, number>();
+			const scrollBySection = new Map<string, number>();
 			if (options?.initialItemId) {
 				const sec = spec.sections[sectionIndex];
 				const foundItem = sec?.items.findIndex((i) => i.id === options.initialItemId) ?? -1;
@@ -291,9 +516,11 @@ export async function openTabbedSplitWorkspace(
 
 			let busy = false;
 			let tabHitRanges: Array<{ startCol: number; endCol: number; index: number }> = [];
+			let tabRowIndex = -1;
 			let listRowOffset = 0;
 			let listVisibleStart = 0;
 			let listVisibleEnd = 0;
+			let lastListCapacity = DEFAULT_SPLIT_BODY_ROWS;
 			let lastLeftWidth = 40;
 
 			const topBorder = new DynamicBorder((s) => theme.fg("accent", s));
@@ -317,6 +544,20 @@ export async function openTabbedSplitWorkspace(
 				if (sec.items.length === 0) return;
 				const clamped = ((next % sec.items.length) + sec.items.length) % sec.items.length;
 				selectedBySection.set(sec.id, clamped);
+			};
+
+			/** 锚定视口滚动：仅当选中项越出当前可见窗口边缘时移动窗口，避免常规移动导致整页跳动 */
+			const resolveAnchoredScroll = (sec: WorkspaceSection, selIdx: number, capacity: number): number => {
+				const maxOffset = Math.max(0, sec.items.length - capacity);
+				let offset = Math.max(0, Math.min(maxOffset, scrollBySection.get(sec.id) ?? 0));
+				if (selIdx < offset) {
+					offset = selIdx;
+				} else if (selIdx >= offset + capacity) {
+					offset = selIdx - capacity + 1;
+				}
+				offset = Math.max(0, Math.min(maxOffset, offset));
+				scrollBySection.set(sec.id, offset);
+				return offset;
 			};
 
 			const refreshSpec = (): void => {
@@ -368,7 +609,7 @@ export async function openTabbedSplitWorkspace(
 					spec = buildSpec();
 				},
 				render(width: number): string[] {
-					const safeWidth = Math.max(20, width);
+					const safeWidth = Math.max(24, width);
 					const lines: string[] = [];
 					const themeAdapter: ThemeLike = {
 						fg: (c, t) => theme.fg(c, t),
@@ -377,121 +618,125 @@ export async function openTabbedSplitWorkspace(
 
 					lines.push(...topBorder.render(safeWidth));
 
-					// 顶栏标题与右侧徽章同排展示，窄屏自动换行
+					// 顶栏严格单行（左标题 + 右对齐状态徽章），绝不折行
 					const leftTitle = ` ${theme.fg("accent", theme.bold(spec.title))}`;
-					if (spec.headerRight) {
-						const rightBadge = `${theme.fg("muted", spec.headerRight)} `;
+					const badgeSpec = spec.headerBadge ?? (spec.headerRight ? { text: spec.headerRight, tone: "muted" as const } : undefined);
+					if (badgeSpec) {
+						const rightBadge = `${applyTone(themeAdapter, badgeSpec.tone ?? "muted", badgeSpec.text)} `;
 						const gap = safeWidth - visibleWidth(leftTitle) - visibleWidth(rightBadge);
 						if (gap >= 2) {
 							lines.push(`${leftTitle}${" ".repeat(gap)}${rightBadge}`);
 						} else {
-							lines.push(truncateToWidth(leftTitle, safeWidth, "…"));
-							lines.push(truncateToWidth(` ${theme.fg("muted", spec.headerRight)}`, safeWidth, "…"));
+							const availTitle = Math.max(8, safeWidth - visibleWidth(rightBadge) - 2);
+							const clippedTitle = truncateToWidth(leftTitle, availTitle, "…");
+							const pad = Math.max(1, safeWidth - visibleWidth(clippedTitle) - visibleWidth(rightBadge));
+							lines.push(truncateToWidth(`${clippedTitle}${" ".repeat(pad)}${rightBadge}`, safeWidth, "…"));
 						}
 					} else {
 						lines.push(truncateToWidth(leftTitle, safeWidth, "…"));
 					}
-					if (spec.bannerLines) {
-						const innerBannerWidth = Math.max(10, safeWidth - 2);
-						for (const bLine of spec.bannerLines) {
-							for (const wrapped of wrapTextWithAnsi(theme.fg("muted", bLine), innerBannerWidth)) {
-								lines.push(truncateToWidth(` ${wrapped}`, safeWidth, "…"));
-							}
-						}
+
+					// 可选单行指标条（严格单行截断，高度恒定）
+					if (spec.summarySegments && spec.summarySegments.length > 0) {
+						lines.push(renderSummaryLine(spec.summarySegments, safeWidth, themeAdapter));
 					}
 
-					// 多分区横向标签栏
+					// 多分区横向标签栏（固定 1 行 + 1 条底分隔线）
 					tabHitRanges = [];
+					tabRowIndex = -1;
 					const hasTabs = spec.sections.length > 1;
 					if (hasTabs) {
-						lines.push(theme.fg("dim", "─".repeat(safeWidth)));
-						let tabLine = " ";
-						let colCursor = 1;
-						for (let i = 0; i < spec.sections.length; i++) {
-							const s = spec.sections[i]!;
-							const isActive = i === sectionIndex;
-							const rawTab = isActive ? `▸ [${i + 1} ${s.title}]` : `  ${i + 1} ${s.title}  `;
-							const tabW = visibleWidth(rawTab);
-							if (colCursor + tabW > safeWidth - 1) break;
-							tabHitRanges.push({ startCol: colCursor, endCol: colCursor + tabW, index: i });
-							tabLine += isActive ? theme.fg("accent", theme.bold(rawTab)) : theme.fg("muted", rawTab);
-							colCursor += tabW;
-							if (i < spec.sections.length - 1 && colCursor + 2 < safeWidth) {
-								tabLine += theme.fg("dim", " │");
-								colCursor += 2;
-							}
-						}
-						lines.push(truncateToWidth(tabLine, safeWidth, "…"));
-						lines.push(theme.fg("dim", "─".repeat(safeWidth)));
-					} else {
-						lines.push("");
+						tabRowIndex = lines.length;
+						const tabBar = renderTabBar(spec.sections, sectionIndex, safeWidth, themeAdapter);
+						tabHitRanges = tabBar.hitRanges;
+						lines.push(tabBar.line);
 					}
-
-					const sec = getActiveSection();
-					if (!sec || sec.items.length === 0) {
-						lines.push(truncateToWidth(` ${theme.fg("muted", "暂无可用项目")}`, safeWidth, "…"));
-						lines.push(...bottomBorder.render(safeWidth));
-						return lines;
-					}
-
-					const selIdx = getSelectedIndex(sec);
-					const selItem = sec.items[selIdx];
-					const detailTitle = selItem?.detailTitle ?? sec.detailTitle ?? "详情预览";
-					const detailSource = selItem?.detailLines ?? sec.detailLines ?? [];
+					lines.push(theme.fg("dim", "─".repeat(safeWidth)));
 
 					const isSplit = safeWidth >= SPLIT_LAYOUT_MIN_WIDTH;
+					const splitRows = Math.max(6, spec.bodyRows ?? DEFAULT_SPLIT_BODY_ROWS);
+					const listCapacity = isSplit ? splitRows : NARROW_LIST_ROWS;
+					const detailCapacity = isSplit ? splitRows : NARROW_DETAIL_ROWS;
+					lastListCapacity = listCapacity;
+
+					const sec = getActiveSection();
 					const leftWidth = isSplit
-						? Math.min(46, Math.max(30, Math.floor((safeWidth - 3) * 0.43)))
-						: safeWidth - 1;
+						? Math.min(42, Math.max(28, Math.floor((safeWidth - 3) * 0.42)))
+						: safeWidth;
 					lastLeftWidth = leftWidth;
 					const rightWidth = isSplit ? Math.max(20, safeWidth - 3 - leftWidth) : safeWidth - 2;
 
-					// 渲染左栏项目（带可视窗口滚动）
-					const startIdx = Math.max(
-						0,
-						Math.min(selIdx - Math.floor(MAX_LEFT_VISIBLE_ROWS / 2), sec.items.length - MAX_LEFT_VISIBLE_ROWS),
-					);
-					const endIdx = Math.min(startIdx + MAX_LEFT_VISIBLE_ROWS, sec.items.length);
-					listVisibleStart = startIdx;
-					listVisibleEnd = endIdx;
 					listRowOffset = lines.length;
-
+					let selIdx = 0;
+					let totalItems = 0;
 					const leftRows: string[] = [];
-					for (let i = startIdx; i < endIdx; i++) {
-						leftRows.push(renderLeftItemRow(sec.items[i]!, i === selIdx, leftWidth, themeAdapter));
-					}
-					if (startIdx > 0 || endIdx < sec.items.length) {
-						leftRows.push(
-							padRightVisible(theme.fg("dim", `  (${selIdx + 1}/${sec.items.length})`), leftWidth),
+					let rightRows: string[];
+
+					if (!sec || sec.items.length === 0) {
+						listVisibleStart = 0;
+						listVisibleEnd = 0;
+						leftRows.push(padRightVisible(` ${theme.fg("muted", "暂无可用项目")}`, leftWidth));
+						while (leftRows.length < listCapacity) leftRows.push(" ".repeat(leftWidth));
+						rightRows = renderDetailColumn(undefined, undefined, [], rightWidth, detailCapacity, themeAdapter);
+					} else {
+						totalItems = sec.items.length;
+						selIdx = getSelectedIndex(sec);
+						const startIdx = resolveAnchoredScroll(sec, selIdx, listCapacity);
+						const endIdx = Math.min(startIdx + listCapacity, totalItems);
+						listVisibleStart = startIdx;
+						listVisibleEnd = endIdx;
+
+						for (let i = startIdx; i < endIdx; i++) {
+							leftRows.push(renderLeftItemRow(sec.items[i]!, i === selIdx, leftWidth, themeAdapter));
+						}
+						// 不足固定行数时补空白行，锁定列表高度
+						while (leftRows.length < listCapacity) {
+							leftRows.push(" ".repeat(leftWidth));
+						}
+
+						const selItem = sec.items[selIdx];
+						const detailTitle = selItem?.detailTitle ?? sec.detailTitle ?? "详情";
+						rightRows = renderDetailColumn(
+							detailTitle,
+							selItem?.detailEntries ?? sec.detailEntries,
+							selItem?.detailLines ?? sec.detailLines,
+							rightWidth,
+							detailCapacity,
+							themeAdapter,
 						);
 					}
 
-					const rightRows = renderDetailColumn(detailTitle, detailSource, rightWidth, themeAdapter);
-
 					if (isSplit) {
 						const divider = ` ${theme.fg("dim", "│")} `;
-						const bodyHeight = Math.max(leftRows.length, rightRows.length, 5);
-						const blankLeft = " ".repeat(leftWidth);
-						for (let r = 0; r < bodyHeight; r++) {
-							const lCell = leftRows[r] ?? blankLeft;
+						for (let r = 0; r < splitRows; r++) {
+							const lCell = leftRows[r] ?? " ".repeat(leftWidth);
 							const rCell = rightRows[r] ?? "";
 							lines.push(truncateToWidth(`${lCell}${divider}${rCell}`, safeWidth, ""));
 						}
 					} else {
-						for (const row of leftRows) {
-							lines.push(truncateToWidth(row, safeWidth, "…"));
+						for (let r = 0; r < listCapacity; r++) {
+							lines.push(truncateToWidth(leftRows[r] ?? "", safeWidth, "…"));
 						}
 						lines.push(theme.fg("dim", "─".repeat(safeWidth)));
-						for (const row of rightRows) {
-							lines.push(truncateToWidth(` ${row}`, safeWidth, "…"));
+						for (let r = 0; r < detailCapacity; r++) {
+							lines.push(truncateToWidth(` ${rightRows[r] ?? ""}`, safeWidth, "…"));
 						}
 					}
 
-					const footerHint = hasTabs
-						? ` ←→/Tab/1-${spec.sections.length} 切换分区 • ↑↓ 选择 • Enter/Space 操作 • Esc 返回`
-						: " ↑↓ 选择 • Enter 确认 • Esc 返回";
+					// 底栏严格单行：左侧按键提示 + 右侧列表定位页码
+					const posText = totalItems > 0 ? `${selIdx + 1}/${totalItems}${totalItems > listCapacity ? " ↕" : ""}` : "";
+					const leftHint = hasTabs
+						? isSplit
+							? ` ←→/Tab/1-${spec.sections.length} 切页 · ↑↓ 移动 · Enter/Space 操作 · Esc 返回`
+							: " ←→ 切页 · ↑↓ 移动 · Enter/Space · Esc 返回"
+						: " ↑↓ 移动 · Enter 确认 · Esc 返回";
+					const rightPos = posText ? `${theme.fg("dim", posText)} ` : "";
+					const availHintW = Math.max(8, safeWidth - visibleWidth(rightPos) - 1);
+					const clippedHint = truncateToWidth(theme.fg("dim", leftHint), availHintW, "…");
+					const footerGap = Math.max(1, safeWidth - visibleWidth(clippedHint) - visibleWidth(rightPos));
+
 					lines.push(theme.fg("dim", "─".repeat(safeWidth)));
-					lines.push(truncateToWidth(theme.fg("dim", footerHint), safeWidth, "…"));
+					lines.push(truncateToWidth(`${clippedHint}${" ".repeat(footerGap)}${rightPos}`, safeWidth, "…"));
 					lines.push(...bottomBorder.render(safeWidth));
 
 					return lines;
@@ -512,7 +757,7 @@ export async function openTabbedSplitWorkspace(
 					}
 
 					// 点击横向标签栏切换分区
-					if (spec.sections.length > 1 && event.y === listRowOffset - 2) {
+					if (tabRowIndex >= 0 && event.y === tabRowIndex) {
 						const hit = tabHitRanges.find((t) => event.x >= t.startCol && event.x < t.endCol);
 						if (hit) {
 							sectionIndex = hit.index;
@@ -567,7 +812,7 @@ export async function openTabbedSplitWorkspace(
 					if (!sec || sec.items.length === 0) return;
 
 					const curIdx = getSelectedIndex(sec);
-					const pageIdx = getSelectPageIndex(kb, data, curIdx, sec.items.length, MAX_LEFT_VISIBLE_ROWS);
+					const pageIdx = getSelectPageIndex(kb, data, curIdx, sec.items.length, lastListCapacity);
 					if (pageIdx !== undefined) {
 						setSelectedIndex(sec, pageIdx);
 						tui.requestRender();
@@ -597,27 +842,34 @@ export async function openTabbedSplitWorkspace(
 	);
 }
 
-// ───────────────────────── 单分区双栏选择面板辅助 ─────────────────────────
+// ───────────────────────── 单分区固定双栏选择面板辅助 ─────────────────────────
 
 export interface MenuPanelItem {
 	value: string;
 	label: string;
 	valueBadge?: string;
+	valueTone?: DetailTone;
+	/** 非 TUI 模式下 ctx.ui.select 展示文本，默认按 label 与 valueBadge 组合 */
+	selectLabel?: string;
 	detailTitle?: string;
+	detailEntries?: DetailEntry[];
 	detailLines?: string[];
 }
 
 /**
- * 展示单分区左右双栏选择面板（左栏选项列表，右栏实时详情卡片；非 TUI 下回退至 ctx.ui.select）
+ * 展示单分区固定高度左右双栏选择面板（左栏固定窗口列表，右栏实时详情卡片；非 TUI 下回退至 ctx.ui.select）
  */
 export async function selectMenuPanel(
 	ctx: ExtensionContext,
 	params: {
 		title: string;
+		headerBadge?: { text: string; tone?: DetailTone };
 		details?: string;
+		detailEntries?: DetailEntry[];
 		detailTitle?: string;
 		items: readonly (string | MenuPanelItem)[];
 		initialValue?: string;
+		bodyRows?: number;
 	},
 ): Promise<string | undefined> {
 	if (!ctx.hasUI || params.items.length === 0) return undefined;
@@ -628,11 +880,18 @@ export async function selectMenuPanel(
 
 	const canUseCustomTui = ctx.mode === "tui" && typeof ctx.ui.custom === "function";
 	if (!canUseCustomTui) {
-		const header = params.details ? `${params.title}\n${params.details}` : params.title;
-		const labels = normalized.map((item) => (item.valueBadge ? `${item.label}：${item.valueBadge}` : item.label));
+		const plainDetail = params.detailEntries && params.detailEntries.length > 0
+			? formatDetailEntriesPlain(params.detailEntries).join("\n")
+			: params.details;
+		const header = plainDetail ? `${params.title}\n${plainDetail}` : params.title;
+		const labels = normalized.map((item) =>
+			item.selectLabel ?? (item.valueBadge ? `${item.label}：${item.valueBadge}` : item.label),
+		);
 		const picked = await ctx.ui.select(header, labels);
 		if (!picked) return undefined;
-		const matched = normalized[labels.indexOf(picked)] ?? normalized.find((i) => i.value === picked || i.label === picked);
+		const matched =
+			normalized[labels.indexOf(picked)] ??
+			normalized.find((i) => i.value === picked || i.label === picked);
 		return matched?.value;
 	}
 
@@ -643,17 +902,22 @@ export async function selectMenuPanel(
 		ctx,
 		() => ({
 			title: params.title,
+			headerBadge: params.headerBadge,
+			bodyRows: params.bodyRows,
 			sections: [
 				{
 					id: "main",
 					title: params.title,
-					detailTitle: params.detailTitle ?? "当前信息",
+					detailTitle: params.detailTitle ?? "详情",
+					detailEntries: params.detailEntries,
 					detailLines: defaultLines,
 					items: normalized.map((item) => ({
 						id: item.value,
 						label: item.label,
 						value: item.valueBadge,
+						valueTone: item.valueTone,
 						detailTitle: item.detailTitle,
+						detailEntries: item.detailEntries,
 						detailLines: item.detailLines,
 						onActivate: () => {
 							selectedResult = item.value;
@@ -669,7 +933,7 @@ export async function selectMenuPanel(
 	return selectedResult;
 }
 
-// ───────────────────────── /fusion config 路由与界面设置面板（3 分区双栏） ─────────────────────────
+// ───────────────────────── /fusion config 路由与界面设置面板（3 分区固定双栏） ─────────────────────────
 
 export interface ConfigPanelCallbacks {
 	getConfig: () => FusionRouterConfig;
@@ -698,8 +962,12 @@ function boolLabel(value: boolean): string {
 	return value ? "开启" : "关闭";
 }
 
+function boolTone(value: boolean): DetailTone {
+	return value ? "success" : "dim";
+}
+
 function scopeDisplayLabel(scope: "global" | "project"): string {
-	return scope === "project" ? "项目配置 (.pi)" : "全局配置 (~/.pi)";
+	return scope === "project" ? "项目配置" : "全局配置";
 }
 
 function cycleChoice<T extends string>(current: T, choices: readonly T[]): T {
@@ -707,7 +975,7 @@ function cycleChoice<T extends string>(current: T, choices: readonly T[]): T {
 	return choices[(idx + 1) % choices.length]!;
 }
 
-/** 打开 3 分区双栏路由与界面设置面板 */
+/** 打开 3 分区固定高度双栏路由与界面设置面板 */
 export async function openFusionSettingsPanel(
 	ctx: ExtensionContext,
 	callbacks: ConfigPanelCallbacks,
@@ -729,20 +997,8 @@ export async function openFusionSettingsPanel(
 		}
 	};
 
-	const buildOverviewLines = (cfg: FusionRouterConfig): string[] => [
-		`总开关：${boolLabel(cfg.enabled)}   运行模式：${cfg.mode}`,
-		`分类器：${formatClassifierChoice(cfg)}`,
-		`思考模式：${cfg.thinkingMode}`,
-		`粘性保持：${boolLabel(cfg.redecision.stickyDuringToolLoop)}   新消息重决策：${boolLabel(cfg.redecision.redecideOnTaskShift)}`,
-		`签名保护：${boolLabel(cfg.redecision.protectThinkingSignature)}   报错阈值：${cfg.redecision.redecideOnConsecutiveToolErrors}   周期复查：${cfg.redecision.periodicReviewSteps}`,
-		`健康追踪：${boolLabel(cfg.health.enabled)}   故障转移：${boolLabel(cfg.health.autoFailover)}`,
-		`状态栏：${boolLabel(cfg.ui.showStatusBar)}   切换通知：${boolLabel(cfg.ui.notifyOnSwitch)}   故障通知：${boolLabel(cfg.ui.notifyOnFailover)}`,
-		`保存位置：${scopeDisplayLabel(activeScope)}`,
-	];
-
 	await openTabbedSplitWorkspace(ctx, () => {
 		const cfg = callbacks.getConfig();
-		const overview = buildOverviewLines(cfg);
 		const errValues = Array.from(new Set(["0", "1", "2", "3", "4", "5", String(cfg.redecision.redecideOnConsecutiveToolErrors)]));
 		const stepValues = Array.from(new Set(["0", "4", "8", "12", "16", "24", String(cfg.redecision.periodicReviewSteps)]));
 
@@ -750,25 +1006,49 @@ export async function openFusionSettingsPanel(
 			id: string;
 			label: string;
 			value: string;
+			valueTone?: DetailTone;
 			desc: string;
+			extra?: DetailEntry[];
+			hint?: string;
 			onToggle: () => void | Promise<void>;
 			allowSpace?: boolean;
 		}): WorkspaceItem => ({
 			id: params.id,
 			label: params.label,
 			value: params.value,
+			valueTone: params.valueTone,
 			allowSpace: params.allowSpace ?? true,
 			detailTitle: params.label,
-			detailLines: [params.desc, "", "── 当前配置速览 ──", ...overview],
+			detailEntries: [
+				{ kind: "kv", key: "当前值", value: params.value, tone: params.valueTone ?? "text" },
+				{ kind: "spacer" },
+				{ kind: "text", text: params.desc, tone: "text" },
+				...(params.extra ? [{ kind: "spacer" as const }, ...params.extra] : []),
+				{ kind: "spacer" },
+				{ kind: "hint", text: params.hint ?? "Space / Enter 切换" },
+			],
 			onActivate: async () => {
 				await params.onToggle();
 			},
 		});
 
+		const headerBadge = cfg.enabled
+			? {
+					text: `● ${cfg.mode === "observe" ? "观察" : "自动"} · ${scopeDisplayLabel(activeScope)}`,
+					tone: (cfg.mode === "observe" ? "warning" : "success") as DetailTone,
+				}
+			: {
+					text: `○ 已停用 · ${scopeDisplayLabel(activeScope)}`,
+					tone: "dim" as DetailTone,
+				};
+
+		const errCount = cfg.redecision.redecideOnConsecutiveToolErrors;
+		const reviewSteps = cfg.redecision.periodicReviewSteps;
+
 		return {
-			title: "Pi-Fusion 路由策略与界面设置",
-			headerRight: `[${cfg.enabled ? `已启用 • ${cfg.mode}` : "已停用"}]  保存：${scopeDisplayLabel(activeScope)}`,
-			bannerLines: [`分类器：${formatClassifierChoice(cfg)}  │  思考模式：${cfg.thinkingMode}`],
+			title: "Pi-Fusion 设置",
+			headerBadge,
+			bodyRows: 8,
 			sections: [
 				{
 					id: "core",
@@ -778,21 +1058,30 @@ export async function openFusionSettingsPanel(
 							id: "enabled",
 							label: "路由器总开关",
 							value: boolLabel(cfg.enabled),
-							desc: "关闭后始终派发默认回退模型，跳过分类器选路。",
+							valueTone: boolTone(cfg.enabled),
+							desc: "关闭后跳过分类器，始终派发默认回退模型。",
 							onToggle: () => savePatch({ enabled: !cfg.enabled }),
 						}),
 						makeItem({
 							id: "mode",
 							label: "运行模式",
 							value: cfg.mode,
-							desc: "auto 自动按决策结果派发；observe 记录推荐结果但派发默认模型。",
+							valueTone: cfg.mode === "observe" ? "warning" : "success",
+							desc: "控制分类器决策是否实际切换派发模型。",
+							extra: [
+								{ kind: "kv", key: "auto", value: "按决策结果自动切换模型与思考深度", tone: "muted" },
+								{ kind: "kv", key: "observe", value: "仅记录推荐结果，实际派发默认模型", tone: "muted" },
+							],
 							onToggle: () => savePatch({ mode: cfg.mode === "auto" ? "observe" : "auto" }),
 						}),
 						makeItem({
 							id: "classifier",
 							label: "决策分类器",
 							value: formatClassifierChoice(cfg),
-							desc: "选择专用决策模型，auto 按内置优先级自动发现。",
+							valueTone: "text",
+							desc: "指定专用决策模型；auto 按内置优先级自动发现。",
+							extra: [{ kind: "kv", key: "可选项", value: `${classifierChoices.length} 个`, tone: "muted" }],
+							hint: "Space / Enter 循环切换分类器",
 							onToggle: () => {
 								const next = cycleChoice(formatClassifierChoice(cfg), classifierChoices);
 								const patch = classifierChoiceToPatch(next);
@@ -803,7 +1092,13 @@ export async function openFusionSettingsPanel(
 							id: "thinkingMode",
 							label: "思考强度模式",
 							value: cfg.thinkingMode,
-							desc: "auto 由分类器决定；passthrough 透传当前选择；profile-default 使用模型默认档位。",
+							valueTone: "text",
+							desc: "控制目标模型推理强度的决策来源。",
+							extra: [
+								{ kind: "kv", key: "auto", value: "由分类器按任务难度决定", tone: "muted" },
+								{ kind: "kv", key: "passthrough", value: "透传 Pi 当前选择的档位", tone: "muted" },
+								{ kind: "kv", key: "profile", value: "使用模型画像默认档位", tone: "muted" },
+							],
 							onToggle: () =>
 								savePatch({
 									thinkingMode: cycleChoice(
@@ -816,7 +1111,12 @@ export async function openFusionSettingsPanel(
 							id: "saveScope",
 							label: "配置保存位置",
 							value: scopeDisplayLabel(activeScope),
-							desc: "切换后续修改写入全局配置还是当前项目配置。",
+							valueTone: "accent",
+							desc: "决定后续修改写入全局配置还是项目配置。",
+							extra: [
+								{ kind: "kv", key: "全局", value: "~/.pi/agent/fusion-router.json", tone: "dim" },
+								{ kind: "kv", key: "项目", value: ".pi/fusion-router.json", tone: "dim" },
+							],
 							onToggle: () => {
 								activeScope = activeScope === "project" ? "global" : "project";
 								callbacks.onScopeChange?.(activeScope);
@@ -832,6 +1132,7 @@ export async function openFusionSettingsPanel(
 							id: "stickyDuringToolLoop",
 							label: "工具循环粘性保持",
 							value: boolLabel(cfg.redecision.stickyDuringToolLoop),
+							valueTone: boolTone(cfg.redecision.stickyDuringToolLoop),
 							desc: "工具调用返回后优先保持当前模型，保护上下文缓存。",
 							onToggle: () => savePatch({ redecision: { stickyDuringToolLoop: !cfg.redecision.stickyDuringToolLoop } }),
 						}),
@@ -839,6 +1140,7 @@ export async function openFusionSettingsPanel(
 							id: "redecideOnTaskShift",
 							label: "新消息重新决策",
 							value: boolLabel(cfg.redecision.redecideOnTaskShift),
+							valueTone: boolTone(cfg.redecision.redecideOnTaskShift),
 							desc: "收到新用户消息时重新评估模型；关闭后保持当前会话模型。",
 							onToggle: () => savePatch({ redecision: { redecideOnTaskShift: !cfg.redecision.redecideOnTaskShift } }),
 						}),
@@ -846,27 +1148,32 @@ export async function openFusionSettingsPanel(
 							id: "protectThinkingSignature",
 							label: "思考签名保护",
 							value: boolLabel(cfg.redecision.protectThinkingSignature),
-							desc: "当前轮次已产生思考内容时避免切换模型，保留完整推理上下文。",
+							valueTone: boolTone(cfg.redecision.protectThinkingSignature),
+							desc: "本轮已产生思考块时锁定周期复查，避免跨模型丢失推理签名。",
 							onToggle: () =>
 								savePatch({ redecision: { protectThinkingSignature: !cfg.redecision.protectThinkingSignature } }),
 						}),
 						makeItem({
 							id: "redecideOnConsecutiveToolErrors",
 							label: "连续工具报错阈值",
-							value: String(cfg.redecision.redecideOnConsecutiveToolErrors),
-							desc: "连续多少次工具报错后触发重新选路（0 表示关闭）。",
+							value: errCount > 0 ? `${errCount} 次` : "关闭",
+							valueTone: errCount > 0 ? "text" : "dim",
+							desc: "连续工具报错达到该次数后触发重新选路。",
+							extra: [{ kind: "kv", key: "可选值", value: "0(关) · 1 · 2 · 3 · 4 · 5", tone: "muted" }],
 							onToggle: () => {
-								const next = Number(cycleChoice(String(cfg.redecision.redecideOnConsecutiveToolErrors), errValues));
+								const next = Number(cycleChoice(String(errCount), errValues));
 								savePatch({ redecision: { redecideOnConsecutiveToolErrors: next } });
 							},
 						}),
 						makeItem({
 							id: "periodicReviewSteps",
 							label: "周期复查步数",
-							value: String(cfg.redecision.periodicReviewSteps),
-							desc: "工具循环每执行多少步重新评估一次模型（0 表示关闭）。",
+							value: reviewSteps > 0 ? `${reviewSteps} 步` : "关闭",
+							valueTone: reviewSteps > 0 ? "text" : "dim",
+							desc: "工具循环每执行指定步数后重新评估一次模型。",
+							extra: [{ kind: "kv", key: "可选值", value: "0(关) · 4 · 8 · 12 · 16 · 24", tone: "muted" }],
 							onToggle: () => {
-								const next = Number(cycleChoice(String(cfg.redecision.periodicReviewSteps), stepValues));
+								const next = Number(cycleChoice(String(reviewSteps), stepValues));
 								savePatch({ redecision: { periodicReviewSteps: next } });
 							},
 						}),
@@ -880,20 +1187,23 @@ export async function openFusionSettingsPanel(
 							id: "healthEnabled",
 							label: "健康冷却追踪",
 							value: boolLabel(cfg.health.enabled),
-							desc: "记录限流、超时等上游故障并对异常模型执行指数退避冷却。",
+							valueTone: boolTone(cfg.health.enabled),
+							desc: "记录限流、超时等故障并对异常模型执行指数退避冷却。",
 							onToggle: () => savePatch({ health: { enabled: !cfg.health.enabled } }),
 						}),
 						makeItem({
 							id: "autoFailover",
 							label: "故障自动转移",
 							value: boolLabel(cfg.health.autoFailover),
-							desc: "请求遇到可重试故障时自动切换至健康的备用模型。",
+							valueTone: boolTone(cfg.health.autoFailover),
+							desc: "遇到可重试故障时自动切换至下一个健康备用模型。",
 							onToggle: () => savePatch({ health: { autoFailover: !cfg.health.autoFailover } }),
 						}),
 						makeItem({
 							id: "showStatusBar",
 							label: "底部状态栏显示",
 							value: boolLabel(cfg.ui.showStatusBar),
+							valueTone: boolTone(cfg.ui.showStatusBar),
 							desc: "在底部状态栏展示当前激活的模型与思考强度。",
 							onToggle: () => savePatch({ ui: { showStatusBar: !cfg.ui.showStatusBar } }),
 						}),
@@ -901,6 +1211,7 @@ export async function openFusionSettingsPanel(
 							id: "notifyOnSwitch",
 							label: "切换模型通知",
 							value: boolLabel(cfg.ui.notifyOnSwitch),
+							valueTone: boolTone(cfg.ui.notifyOnSwitch),
 							desc: "模型发生切换时弹出提示消息。",
 							onToggle: () => savePatch({ ui: { notifyOnSwitch: !cfg.ui.notifyOnSwitch } }),
 						}),
@@ -908,6 +1219,7 @@ export async function openFusionSettingsPanel(
 							id: "notifyOnFailover",
 							label: "故障转移通知",
 							value: boolLabel(cfg.ui.notifyOnFailover),
+							valueTone: boolTone(cfg.ui.notifyOnFailover),
 							desc: "发生故障冷却并自动转移时弹出告警消息。",
 							onToggle: () => savePatch({ ui: { notifyOnFailover: !cfg.ui.notifyOnFailover } }),
 						}),

@@ -26,11 +26,14 @@ import type {
 } from "./types.ts";
 import {
 	classifierChoiceToPatch,
+	type DetailEntry,
+	type DetailTone,
 	formatClassifierChoice,
 	type MenuPanelItem,
 	openFusionSettingsPanel,
 	openTabbedSplitWorkspace,
 	selectMenuPanel,
+	type SummarySegment,
 	updateRouterStatusBar,
 	type WorkspaceItem,
 } from "./ui.ts";
@@ -127,8 +130,25 @@ function boolText(value: boolean): string {
 	return value ? "开启" : "关闭";
 }
 
+function boolTone(value: boolean): DetailTone {
+	return value ? "success" : "dim";
+}
+
+function shortModelLabel(key: string): string {
+	return parseModelKey(key)?.id ?? key;
+}
+
 function scopeLabel(scope: SaveScope): string {
 	return scope === "project" ? "项目配置" : "全局配置";
+}
+
+function buildHeaderBadge(config: FusionRouterConfig, scope: SaveScope): { text: string; tone: DetailTone } {
+	if (!config.enabled) {
+		return { text: `○ 已停用 · ${scopeLabel(scope)}`, tone: "dim" };
+	}
+	return config.mode === "observe"
+		? { text: `● 观察 · ${scopeLabel(scope)}`, tone: "warning" }
+		: { text: `● 自动 · ${scopeLabel(scope)}`, tone: "success" };
 }
 
 function defaultSaveScope(runtime: FusionCommandRuntime): SaveScope {
@@ -264,6 +284,42 @@ function buildExplainLines(state: FusionRouteState | undefined): string[] {
 	);
 
 	return lines;
+}
+
+function buildExplainDetailEntries(state: FusionRouteState | undefined): DetailEntry[] {
+	if (!state) {
+		return [
+			{ kind: "text", text: "当前会话尚无路由决策记录。", tone: "muted" },
+			{ kind: "spacer" },
+			{ kind: "hint", text: "Enter 发起一次干跑测试" },
+		];
+	}
+
+	const d = state.lastDecision;
+	const entries: DetailEntry[] = [
+		{ kind: "kv", key: "派发模型", value: `${d.model} (${d.thinkingLevel})`, tone: "accent" },
+		{ kind: "kv", key: "触发类型", value: d.trigger, tone: d.trigger === "failover" ? "warning" : "text" },
+		{ kind: "kv", key: "决策说明", value: d.reason, tone: "text" },
+	];
+	if (d.classifierModel) {
+		const latency = d.latencyMs !== undefined ? ` (${d.latencyMs}ms)` : "";
+		entries.push({ kind: "kv", key: "分类器", value: `${d.classifierModel}${latency}`, tone: "muted" });
+	}
+	if (d.recommendedModel) {
+		const conf = d.confidence !== undefined ? ` (${Math.round(d.confidence * 100)}%)` : "";
+		entries.push({ kind: "kv", key: "推荐结果", value: `${d.recommendedModel}${conf}`, tone: "text" });
+	}
+	if (d.switchBenefit) {
+		const conf = d.switchBenefitConfidence !== undefined ? ` (${Math.round(d.switchBenefitConfidence * 100)}%)` : "";
+		entries.push({ kind: "kv", key: "切换收益", value: `${d.switchBenefit}${conf}`, tone: "muted" });
+	}
+	entries.push({
+		kind: "kv",
+		key: "轮次统计",
+		value: `延续 ${state.continuationSteps} 步 · 工具连错 ${state.consecutiveToolErrors} 次`,
+		tone: "muted",
+	});
+	return entries;
 }
 
 async function handleStatus(ctx: ExtensionCommandContext, runtime: FusionCommandRuntime): Promise<void> {
@@ -525,73 +581,196 @@ async function promptClassifierMinConfidence(
 	);
 }
 
-/** 交互式决策分类器查看与管理菜单（双栏面板） */
+/** 交互式决策分类器查看与管理菜单（固定列表双栏面板） */
 async function openClassifierManager(
 	ctx: ExtensionCommandContext,
 	runtime: FusionCommandRuntime,
 	options?: { scopeRef?: ScopeRef; exitOnSelectClassifier?: boolean },
 ): Promise<void> {
 	const scopeRef: ScopeRef = options?.scopeRef ?? { value: defaultSaveScope(runtime) };
+	let lastSelectedId: string | undefined;
+
 	for (;;) {
 		const config = runtime.getLoadedConfig().config;
-		const { text, chain } = await buildClassifierReport(ctx, config);
+		const { chain, custom } = await buildClassifierReport(ctx, config);
 		const current = formatClassifierChoice(config);
 		const classifierChoices = Array.from(new Set(["auto", ...chain.map((c) => c.key)]));
-		const classifierLabels = classifierChoices.map((c) => (c === current ? `${c}（当前）` : c));
 
-		const configureEndpointOption = "配置自定义决策端点";
-		const importEndpointOption = "导入全局分类器端点设置";
-		const clearEndpointOption = "清除自定义决策端点";
-		const timeoutOption = `修改超时时间（当前：${config.classifier.timeoutMs}ms）`;
-		const confidenceOption = `修改最低置信度（当前：${config.classifier.minConfidence}）`;
-		const scopeOption = `保存位置：${scopeLabel(scopeRef.value)}`;
+		const chainEntries: DetailEntry[] =
+			chain.length === 0
+				? [{ kind: "text", text: "未检测到已配置凭据的专用决策分类器。", tone: "warning" }]
+				: [
+						{ kind: "heading", text: `可用分类器链 (${chain.length})` },
+						...chain.slice(0, 5).map((item, idx): DetailEntry => ({
+							kind: "bullet",
+							label: `${idx + 1}. ${item.key}`,
+							value: item.source,
+							tone: idx === 0 ? "success" : "dim",
+						})),
+						...(chain.length > 5 ? [{ kind: "hint" as const, text: `… 其余 ${chain.length - 5} 个` }] : []),
+					];
 
-		const menuOptions = [
-			...classifierLabels,
-			configureEndpointOption,
-			importEndpointOption,
-			...(config.classifier.customEndpoint ? [clearEndpointOption] : []),
-			timeoutOption,
-			confidenceOption,
-			scopeOption,
+		const endpointEntries: DetailEntry[] = custom
+			? [
+					{ kind: "kv", key: "状态", value: "已配置", tone: "success" },
+					{ kind: "kv", key: "地址", value: custom.baseUrl, tone: "text" },
+					{ kind: "kv", key: "协议", value: custom.api, tone: "muted" },
+					{ kind: "kv", key: "模型", value: custom.modelId, tone: "muted" },
+					{
+						kind: "kv",
+						key: "密钥变量",
+						value: config.classifier.customEndpoint?.apiKeyEnv || "默认环境变量",
+						tone: "dim",
+					},
+				]
+			: [
+					{ kind: "kv", key: "状态", value: "未配置", tone: "dim" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "可指向任意兼容的决策服务端点（支持 TypeSafe、Cloudflare、OpenAI Decisions）。", tone: "muted" },
+				];
+
+		const items: MenuPanelItem[] = [
+			...classifierChoices.map((choice): MenuPanelItem => {
+				const isCurrent = choice === current;
+				const matched = chain.find((c) => c.key === choice);
+				return {
+					value: `cls:${choice}`,
+					label: choice,
+					valueBadge: isCurrent ? "当前" : undefined,
+					valueTone: isCurrent ? "success" : undefined,
+					selectLabel: isCurrent ? `${choice}（当前）` : choice,
+					detailTitle: choice === "auto" ? "自动发现分类器" : choice,
+					detailEntries: [
+						{ kind: "kv", key: "当前生效", value: current, tone: "accent" },
+						{
+							kind: "kv",
+							key: "来源",
+							value: choice === "auto" ? "按内置优先级自动选择首个可用分类器" : (matched?.source ?? "显式配置"),
+							tone: "muted",
+						},
+						{ kind: "spacer" },
+						...chainEntries,
+					],
+				};
+			}),
+			{
+				value: "__configure_endpoint__",
+				label: "配置自定义决策端点",
+				valueBadge: custom ? "已配置" : "未配置",
+				valueTone: custom ? "success" : "dim",
+				detailTitle: "自定义决策端点",
+				detailEntries: [...endpointEntries, { kind: "spacer" }, { kind: "hint", text: "Enter 配置地址、协议与密钥变量" }],
+			},
+			{
+				value: "__import_endpoint__",
+				label: "导入全局分类器端点",
+				valueBadge: "导入 ›",
+				valueTone: "muted",
+				detailTitle: "从全局设置导入",
+				detailEntries: [
+					{ kind: "text", text: "读取 Pi 全局 settings.json 中的 classifier 端点与模型设置并写入配置。", tone: "text" },
+					{ kind: "spacer" },
+					...endpointEntries.slice(0, 2),
+				],
+			},
+			{
+				value: "__clear_endpoint__",
+				label: "清除自定义决策端点",
+				valueBadge: config.classifier.customEndpoint ? "清除" : "无",
+				valueTone: config.classifier.customEndpoint ? "warning" : "dim",
+				detailTitle: "清除自定义端点",
+				detailEntries: [
+					...endpointEntries.slice(0, 3),
+					{ kind: "spacer" },
+					{
+						kind: "hint",
+						text: config.classifier.customEndpoint ? "Enter 清除自定义端点并回退自动发现" : "当前未配置自定义端点",
+					},
+				],
+			},
+			{
+				value: "__timeout__",
+				label: "超时时间",
+				valueBadge: `${config.classifier.timeoutMs}ms`,
+				valueTone: "text",
+				detailTitle: "分类器超时时间",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: `${config.classifier.timeoutMs} ms`, tone: "text" },
+					{ kind: "kv", key: "范围", value: `${MIN_CLASSIFIER_TIMEOUT_MS}~${MAX_CLASSIFIER_TIMEOUT_MS} ms`, tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "单次分类请求超时后自动尝试备用链中的下一个分类器。", tone: "muted" },
+				],
+			},
+			{
+				value: "__confidence__",
+				label: "最低置信度",
+				valueBadge: String(config.classifier.minConfidence),
+				valueTone: "text",
+				detailTitle: "分类器最低置信度",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: String(config.classifier.minConfidence), tone: "text" },
+					{ kind: "kv", key: "范围", value: "0 ~ 1", tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "分类器返回的模型置信度低于该阈值时回退至默认模型。", tone: "muted" },
+				],
+			},
+			{
+				value: "__scope__",
+				label: "保存位置",
+				valueBadge: scopeLabel(scopeRef.value),
+				valueTone: "accent",
+				detailTitle: "配置保存层级",
+				detailEntries: [
+					{ kind: "kv", key: "写入目标", value: scopeLabel(scopeRef.value), tone: "accent" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 切换全局或项目配置" },
+				],
+			},
 		];
 
 		const picked = await selectMenuPanel(ctx, {
 			title: "专用决策分类器管理",
-			detailTitle: "分类器与端点详情",
-			details: text,
-			items: menuOptions,
+			headerBadge: buildHeaderBadge(config, scopeRef.value),
+			detailTitle: "分类器链",
+			detailEntries: chainEntries,
+			items,
+			initialValue: lastSelectedId,
+			bodyRows: 10,
 		});
 		if (!picked) return;
+		lastSelectedId = picked;
 
-		if (picked === scopeOption) {
+		if (picked === "__scope__") {
 			scopeRef.value = scopeRef.value === "project" ? "global" : "project";
 			continue;
 		}
-		if (picked === configureEndpointOption) {
+		if (picked === "__configure_endpoint__") {
 			await configureCustomEndpointInteractive(ctx, runtime, scopeRef.value);
 			continue;
 		}
-		if (picked === importEndpointOption) {
+		if (picked === "__import_endpoint__") {
 			importClassifierEndpoint(ctx, runtime, scopeRef.value);
 			continue;
 		}
-		if (picked === clearEndpointOption) {
+		if (picked === "__clear_endpoint__") {
+			if (!config.classifier.customEndpoint) {
+				sendCommandOutput(ctx, "当前未配置自定义决策端点。", "info");
+				continue;
+			}
 			clearCustomClassifierEndpoint(ctx, runtime, config, scopeRef.value);
 			continue;
 		}
-		if (picked === timeoutOption) {
+		if (picked === "__timeout__") {
 			await promptClassifierTimeout(ctx, runtime, scopeRef.value);
 			continue;
 		}
-		if (picked === confidenceOption) {
+		if (picked === "__confidence__") {
 			await promptClassifierMinConfidence(ctx, runtime, scopeRef.value);
 			continue;
 		}
 
-		const idx = classifierLabels.indexOf(picked);
-		const choice = idx >= 0 ? classifierChoices[idx] : undefined;
-		if (!choice) continue;
+		if (!picked.startsWith("cls:")) continue;
+		const choice = picked.slice(4);
 		if (choice !== current) {
 			const patch = classifierChoiceToPatch(choice);
 			if (patch) {
@@ -772,47 +951,74 @@ function formatModelLine(entry: ManagedModelEntry, config: FusionRouterConfig, h
 	return parts.join(" | ");
 }
 
-function buildModelCardLines(
+function getModelStatusBadge(
 	entry: ManagedModelEntry,
 	config: FusionRouterConfig,
 	healthTracker: ModelHealthTracker,
-): string[] {
+): { text: string; tone: DetailTone } {
+	const p = entry.profile;
+	if (!p.enabled) return { text: "停用", tone: "dim" };
+	if (!entry.available) return { text: "未认证", tone: "error" };
+	const health = healthTracker.getSnapshot(entry.key, config.health);
+	if (health.status === "cooldown") {
+		return { text: `冷却 ${formatDurationSeconds(health.remainingCooldownMs)}`, tone: "warning" };
+	}
+	if (config.defaultModel === entry.key) return { text: "★ 默认", tone: "accent" };
+	return { text: `启用 P${p.priority}`, tone: "success" };
+}
+
+function buildModelCardEntries(
+	entry: ManagedModelEntry,
+	config: FusionRouterConfig,
+	healthTracker: ModelHealthTracker,
+): DetailEntry[] {
 	const p = entry.profile;
 	const health = entry.available ? healthTracker.getSnapshot(entry.key, config.health) : undefined;
+	const statusText = p.enabled
+		? config.defaultModel === entry.key
+			? "已启用 · 默认回退"
+			: "已启用"
+		: "已停用";
+	const statusTone: DetailTone = !p.enabled ? "dim" : config.defaultModel === entry.key ? "accent" : "success";
 	const healthText = !entry.available
 		? "未认证"
 		: health?.status === "cooldown"
-			? `冷却中（剩余 ${formatDurationSeconds(health.remainingCooldownMs)}）`
+			? `冷却中 (剩余 ${formatDurationSeconds(health.remainingCooldownMs)})`
 			: "健康";
+	const healthTone: DetailTone = !entry.available ? "error" : health?.status === "cooldown" ? "warning" : "success";
+
 	return [
-		`显示名称：${p.label || p.id}`,
-		`状态：${p.enabled ? "已启用" : "已停用"}   健康：${healthText}${config.defaultModel === entry.key ? "   [默认回退]" : ""}`,
-		`成本档位：${p.costTier}   优先级：P${p.priority}   默认思考：${p.defaultThinking ?? "auto"}`,
-		"",
-		`擅长场景：`,
-		p.specialty || "未设置",
-		"",
-		`不适用场景：`,
-		p.avoid || "未设置",
+		{ kind: "kv", key: "状态", value: statusText, tone: statusTone },
+		{ kind: "kv", key: "健康", value: healthText, tone: healthTone },
+		{ kind: "kv", key: "权重", value: `P${p.priority} · ${p.costTier} · 思考 ${p.defaultThinking ?? "auto"}`, tone: "text" },
+		{ kind: "kv", key: "显示名", value: p.label || p.id, tone: "muted" },
+		{ kind: "kv", key: "擅长", value: p.specialty || "未设置", tone: p.specialty ? "text" : "dim" },
+		{ kind: "kv", key: "避开", value: p.avoid || "未设置", tone: p.avoid ? "muted" : "dim" },
 	];
 }
 
-function buildModelsOverviewLines(
+function buildModelsSummaryEntries(
 	ctx: ExtensionCommandContext,
 	config: FusionRouterConfig,
 	healthTracker: ModelHealthTracker,
-): string[] {
+): DetailEntry[] {
 	const { entries, discovered } = listManagedModels(ctx, config);
-	if (entries.length === 0) return ["当前没有可用的已认证物理模型。"];
-	const lines = [
-		`来源：${discovered ? "自动发现（修改后保存为配置）" : "配置文件"}   共 ${entries.length} 个`,
-		`默认回退模型：${config.defaultModel ?? "未设置（按优先级选取）"}`,
-		"",
-	];
-	for (const entry of entries) {
-		lines.push(`• ${formatModelLine(entry, config, healthTracker)}`);
+	if (entries.length === 0) {
+		return [{ kind: "text", text: "当前没有可用的已认证物理模型。", tone: "warning" }];
 	}
-	return lines;
+	const out: DetailEntry[] = [
+		{ kind: "kv", key: "来源", value: `${discovered ? "自动发现" : "配置文件"} (${entries.length} 个)`, tone: "text" },
+		{ kind: "kv", key: "默认回退", value: config.defaultModel ?? "按优先级选取", tone: config.defaultModel ? "accent" : "muted" },
+		{ kind: "spacer" },
+	];
+	for (const entry of entries.slice(0, 5)) {
+		const badge = getModelStatusBadge(entry, config, healthTracker);
+		out.push({ kind: "bullet", label: entry.key, value: badge.text, tone: badge.tone });
+	}
+	if (entries.length > 5) {
+		out.push({ kind: "hint", text: `… 其余 ${entries.length - 5} 个模型` });
+	}
+	return out;
 }
 
 function listModels(ctx: ExtensionCommandContext, runtime: FusionCommandRuntime): void {
@@ -924,7 +1130,7 @@ function setModelField(
 	);
 }
 
-/** 交互式查看并编辑单个候选模型（双栏画像卡片） */
+/** 交互式查看并编辑单个候选模型（固定列表双栏画像卡片） */
 async function editManagedModel(
 	ctx: ExtensionCommandContext,
 	runtime: FusionCommandRuntime,
@@ -936,60 +1142,151 @@ async function editManagedModel(
 	if (!entry) return;
 	const p = entry.profile;
 	const isDefault = config.defaultModel === key;
-	const cardLines = buildModelCardLines(entry, config, runtime.getHealthTracker());
+	const cardEntries = buildModelCardEntries(entry, config, runtime.getHealthTracker());
 
-	const options = [
-		p.enabled ? "停用该模型" : "启用该模型",
-		isDefault ? "取消默认回退模型" : "设为默认回退模型",
-		`优先级：${p.priority}`,
-		`成本档位：${p.costTier}`,
-		`默认思考强度：${p.defaultThinking ?? "auto"}`,
-		`擅长场景：${p.specialty || "未设置"}`,
-		`不适用场景：${p.avoid || "未设置"}`,
-		`显示名称：${p.label || p.id}`,
+	const items: MenuPanelItem[] = [
+		{
+			value: "toggleEnabled",
+			label: "启用状态",
+			valueBadge: p.enabled ? "已启用" : "已停用",
+			valueTone: boolTone(p.enabled),
+			detailTitle: key,
+			detailEntries: [...cardEntries, { kind: "spacer" }, { kind: "hint", text: `Enter ${p.enabled ? "停用" : "启用"}该模型` }],
+		},
+		{
+			value: "toggleDefault",
+			label: "默认回退模型",
+			valueBadge: isDefault ? "当前默认" : "否",
+			valueTone: isDefault ? "accent" : "dim",
+			detailTitle: "默认回退模型",
+			detailEntries: [
+				{ kind: "kv", key: "当前默认", value: config.defaultModel ?? "按优先级选取", tone: "text" },
+				{ kind: "spacer" },
+				{ kind: "text", text: "分类器不可用、路由停用或观察模式时派发该模型。", tone: "muted" },
+				{ kind: "spacer" },
+				{ kind: "hint", text: isDefault ? "Enter 取消默认回退设置" : "Enter 设该模型为默认回退" },
+			],
+		},
+		{
+			value: "priority",
+			label: "优先级",
+			valueBadge: String(p.priority),
+			valueTone: "text",
+			detailTitle: "优先级 (1~100)",
+			detailEntries: [
+				{ kind: "kv", key: "当前值", value: `P${p.priority}`, tone: "accent" },
+				{ kind: "spacer" },
+				{ kind: "text", text: "数值越高越优先作为默认候选和回退首选。", tone: "muted" },
+				{ kind: "spacer" },
+				{ kind: "hint", text: "Enter 输入新的优先级整数" },
+			],
+		},
+		{
+			value: "costTier",
+			label: "成本档位",
+			valueBadge: p.costTier,
+			valueTone: "text",
+			detailTitle: "成本档位",
+			detailEntries: [
+				{ kind: "kv", key: "当前值", value: p.costTier, tone: "accent" },
+				{ kind: "kv", key: "可选值", value: COST_TIERS.join(" · "), tone: "muted" },
+				{ kind: "spacer" },
+				{ kind: "text", text: "用于大候选池自动收敛与分类器成本权衡。", tone: "muted" },
+			],
+		},
+		{
+			value: "thinking",
+			label: "默认思考强度",
+			valueBadge: p.defaultThinking ?? "auto",
+			valueTone: p.defaultThinking ? "text" : "muted",
+			detailTitle: "默认思考强度",
+			detailEntries: [
+				{ kind: "kv", key: "当前值", value: p.defaultThinking ?? "auto", tone: "accent" },
+				{ kind: "spacer" },
+				{ kind: "text", text: "在 profile-default 模式或分类器未给出强度时采用该档位。", tone: "muted" },
+			],
+		},
+		{
+			value: "specialty",
+			label: "擅长场景",
+			valueBadge: p.specialty ? "已设置" : "未设置",
+			valueTone: p.specialty ? "success" : "dim",
+			detailTitle: "擅长场景描述",
+			detailEntries: [
+				{ kind: "text", text: p.specialty || "未设置", tone: p.specialty ? "text" : "dim" },
+				{ kind: "spacer" },
+				{ kind: "hint", text: "Enter 打开编辑器修改（直接提供给分类器参考）" },
+			],
+		},
+		{
+			value: "avoid",
+			label: "不适用场景",
+			valueBadge: p.avoid ? "已设置" : "未设置",
+			valueTone: p.avoid ? "warning" : "dim",
+			detailTitle: "不适用场景描述",
+			detailEntries: [
+				{ kind: "text", text: p.avoid || "未设置", tone: p.avoid ? "text" : "dim" },
+				{ kind: "spacer" },
+				{ kind: "hint", text: "Enter 打开编辑器修改（留空清除）" },
+			],
+		},
+		{
+			value: "label",
+			label: "显示名称",
+			valueBadge: p.label || p.id,
+			valueTone: "muted",
+			detailTitle: "显示名称",
+			detailEntries: [
+				{ kind: "kv", key: "当前名称", value: p.label || p.id, tone: "text" },
+				{ kind: "kv", key: "模型标识", value: key, tone: "dim" },
+			],
+		},
 	];
+
 	const picked = await selectMenuPanel(ctx, {
-		title: `模型画像详情：${key}`,
+		title: `模型编辑：${shortModelLabel(key)}`,
+		headerBadge: buildHeaderBadge(config, scope),
 		detailTitle: key,
-		details: cardLines.join("\n"),
-		items: options,
+		detailEntries: cardEntries,
+		items,
+		bodyRows: 8,
 	});
 	if (!picked) return;
 
-	switch (options.indexOf(picked)) {
-		case 0:
+	switch (picked) {
+		case "toggleEnabled":
 			setModelEnabled(ctx, runtime, key, !p.enabled, scope);
 			return;
-		case 1:
+		case "toggleDefault":
 			setDefaultModel(ctx, runtime, isDefault ? "clear" : key, scope);
 			return;
-		case 2: {
+		case "priority": {
 			const value = await ctx.ui.input("优先级（1~100）", String(p.priority));
 			if (value === undefined || !value.trim()) return;
 			setModelField(ctx, runtime, key, "priority", value, scope);
 			return;
 		}
-		case 3: {
+		case "costTier": {
 			const value = await ctx.ui.select("成本档位", [...COST_TIERS]);
 			if (value) setModelField(ctx, runtime, key, "costTier", value, scope);
 			return;
 		}
-		case 4: {
+		case "thinking": {
 			const value = await ctx.ui.select("默认思考强度", ["auto", ...THINKING_LEVELS]);
 			if (value) setModelField(ctx, runtime, key, "thinking", value, scope);
 			return;
 		}
-		case 5: {
+		case "specialty": {
 			const value = await ctx.ui.editor("擅长场景", p.specialty);
 			if (value !== undefined) setModelField(ctx, runtime, key, "specialty", value, scope);
 			return;
 		}
-		case 6: {
+		case "avoid": {
 			const value = await ctx.ui.editor("不适用场景（留空表示清除）", p.avoid ?? "");
 			if (value !== undefined) setModelField(ctx, runtime, key, "avoid", value.trim() ? value : "clear", scope);
 			return;
 		}
-		case 7: {
+		case "label": {
 			const value = await ctx.ui.input("显示名称", p.label ?? p.id);
 			if (value !== undefined && value.trim()) setModelField(ctx, runtime, key, "label", value, scope);
 			return;
@@ -997,74 +1294,87 @@ async function editManagedModel(
 	}
 }
 
-/** 交互式候选模型管理菜单（左栏选模型，右栏实时展示该模型完整画像） */
+/** 交互式候选模型管理菜单（固定高度左栏选模型，右栏实时展示结构化画像） */
 async function openModelsManager(
 	ctx: ExtensionCommandContext,
 	runtime: FusionCommandRuntime,
 	scopeRef?: ScopeRef,
 ): Promise<void> {
 	const activeScopeRef: ScopeRef = scopeRef ?? { value: defaultSaveScope(runtime) };
-	let lastPicked: string | undefined;
+	let lastPickedId: string | undefined;
 
 	for (;;) {
 		const config = runtime.getLoadedConfig().config;
 		const { entries, discovered } = listManagedModels(ctx, config);
 		const healthTracker = runtime.getHealthTracker();
-		const overviewLines = buildModelsOverviewLines(ctx, config, healthTracker);
-
-		const scopeOption = `保存位置：${scopeLabel(activeScopeRef.value)}`;
-		const importOption = "导入全部已认证物理模型";
+		const summaryEntries = buildModelsSummaryEntries(ctx, config, healthTracker);
 
 		const items: MenuPanelItem[] = [
 			{
-				value: scopeOption,
-				label: scopeOption,
+				value: "__scope__",
+				label: "保存位置",
+				valueBadge: scopeLabel(activeScopeRef.value),
+				valueTone: "accent",
 				detailTitle: "候选池概览",
-				detailLines: overviewLines,
+				detailEntries: [
+					{ kind: "kv", key: "写入目标", value: scopeLabel(activeScopeRef.value), tone: "accent" },
+					{ kind: "spacer" },
+					...summaryEntries,
+				],
 			},
 			{
-				value: importOption,
-				label: importOption,
+				value: "__import__",
+				label: "导入全部已认证物理模型",
+				valueBadge: "导入 ›",
+				valueTone: "muted",
 				detailTitle: "导入物理模型",
-				detailLines: ["将当前所有已配置凭据的物理模型写入配置文件，便于逐个调整画像参数。", "", ...overviewLines],
+				detailEntries: [
+					{ kind: "text", text: "将当前已认证的物理模型写入配置文件，便于逐项调整优先级与场景画像。", tone: "text" },
+					{ kind: "spacer" },
+					...summaryEntries.slice(0, 2),
+				],
 			},
 			...entries.map((entry): MenuPanelItem => {
-				const line = formatModelLine(entry, config, healthTracker);
+				const badge = getModelStatusBadge(entry, config, healthTracker);
 				return {
-					value: line,
-					label: line,
-					detailTitle: `模型画像：${entry.key}`,
-					detailLines: buildModelCardLines(entry, config, healthTracker),
+					value: `model:${entry.key}`,
+					label: entry.key,
+					valueBadge: badge.text,
+					valueTone: badge.tone,
+					selectLabel: formatModelLine(entry, config, healthTracker),
+					detailTitle: entry.key,
+					detailEntries: [
+						...buildModelCardEntries(entry, config, healthTracker),
+						{ kind: "spacer" },
+						{ kind: "hint", text: "Enter 编辑该模型画像与开关" },
+					],
 				};
 			}),
 		];
 
-		const defaultNote = config.defaultModel ? ` • 默认模型：${config.defaultModel}` : "";
-		const summary = discovered
-			? `自动发现 ${entries.length} 个模型，修改任意项后保存为配置${defaultNote}`
-			: `共 ${entries.length} 个配置模型${defaultNote}`;
-
 		const picked = await selectMenuPanel(ctx, {
-			title: "候选物理模型池管理",
+			title: `候选模型池 (${entries.length}${discovered ? " · 自动" : ""})`,
+			headerBadge: buildHeaderBadge(config, activeScopeRef.value),
 			detailTitle: "候选池概览",
-			details: summary,
+			detailEntries: summaryEntries,
 			items,
-			initialValue: lastPicked,
+			initialValue: lastPickedId,
+			bodyRows: 10,
 		});
 		if (!picked) return;
-		lastPicked = picked;
+		lastPickedId = picked;
 
-		if (picked === scopeOption) {
+		if (picked === "__scope__") {
 			activeScopeRef.value = activeScopeRef.value === "project" ? "global" : "project";
 			continue;
 		}
-		if (picked === importOption) {
+		if (picked === "__import__") {
 			importModels(ctx, runtime, activeScopeRef.value);
 			continue;
 		}
-		const modelOptions = entries.map((entry) => formatModelLine(entry, config, healthTracker));
-		const entry = entries[modelOptions.indexOf(picked)];
-		if (entry) await editManagedModel(ctx, runtime, entry.key, activeScopeRef.value);
+		if (picked.startsWith("model:")) {
+			await editManagedModel(ctx, runtime, picked.slice(6), activeScopeRef.value);
+		}
 	}
 }
 
@@ -1209,7 +1519,7 @@ async function promptMaxCooldownSeconds(
 	);
 }
 
-/** 交互式模型健康与冷却管理菜单（双栏） */
+/** 交互式模型健康与冷却管理菜单（固定顺序双栏面板） */
 async function openHealthManager(
 	ctx: ExtensionCommandContext,
 	runtime: FusionCommandRuntime,
@@ -1217,49 +1527,154 @@ async function openHealthManager(
 ): Promise<void> {
 	const activeScopeRef: ScopeRef = scopeRef ?? { value: defaultSaveScope(runtime) };
 	const tracker = runtime.getHealthTracker();
+	let lastPickedId: string | undefined;
 
 	for (;;) {
 		const config = runtime.getLoadedConfig().config;
-		const { text, snapshots } = buildHealthReport(ctx, runtime);
+		const { snapshots } = buildHealthReport(ctx, runtime);
 		const degraded = snapshots.filter((s) => s.status !== "healthy");
-		const resetModelOptions = degraded.map((s) =>
-			s.status === "cooldown"
-				? `重置模型健康状态：${s.key}（冷却 ${formatDurationSeconds(s.remainingCooldownMs)}）`
-				: `重置模型健康状态：${s.key}（历史失败 ${s.consecutiveFailures} 次）`,
-		);
-		const resetAllOption = "重置全部模型健康状态";
-		const toggleHealthOption = `健康冷却追踪：${boolText(config.health.enabled)}`;
-		const toggleFailoverOption = `故障自动转移：${boolText(config.health.autoFailover)}`;
-		const cooldownOption = `修改基础冷却时长（当前：${config.health.cooldownSeconds}s）`;
-		const maxCooldownOption = `修改最大冷却时长（当前：${config.health.maxCooldownSeconds}s）`;
-		const scopeOption = `保存位置：${scopeLabel(activeScopeRef.value)}`;
+
+		const overviewEntries: DetailEntry[] = [
+			{
+				kind: "kv",
+				key: "异常模型",
+				value: degraded.length > 0 ? `${degraded.length}/${snapshots.length} 个` : "全部健康",
+				tone: degraded.length > 0 ? "warning" : "success",
+			},
+			{ kind: "kv", key: "冷却范围", value: `${config.health.cooldownSeconds}s ~ ${config.health.maxCooldownSeconds}s`, tone: "muted" },
+			{ kind: "spacer" },
+			...(degraded.length > 0
+				? degraded.slice(0, 4).map((s): DetailEntry => ({
+						kind: "bullet",
+						label: s.key,
+						value:
+							s.status === "cooldown"
+								? `冷却 ${formatDurationSeconds(s.remainingCooldownMs)}`
+								: `待恢复 (${s.consecutiveFailures}次)`,
+						tone: "warning",
+					}))
+				: [{ kind: "text" as const, text: "当前所有候选模型均处于健康状态。", tone: "success" as const }]),
+		];
+
+		// 顶部固定 6 个管理项 + 下方固定列出全部模型，重置后列表长度与位置保持稳定
+		const items: MenuPanelItem[] = [
+			{
+				value: "__reset_all__",
+				label: "重置全部模型健康状态",
+				valueBadge: degraded.length > 0 ? `${degraded.length} 个异常` : "全部健康",
+				valueTone: degraded.length > 0 ? "warning" : "success",
+				detailTitle: "健康总览",
+				detailEntries: [...overviewEntries, { kind: "spacer" }, { kind: "hint", text: "Enter 立即清空全部冷却记录" }],
+			},
+			{
+				value: "__toggle_health__",
+				label: "健康冷却追踪",
+				valueBadge: boolText(config.health.enabled),
+				valueTone: boolTone(config.health.enabled),
+				detailTitle: "健康冷却追踪",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.health.enabled), tone: boolTone(config.health.enabled) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "记录限流、超时等上游故障并对异常模型执行指数退避冷却。", tone: "text" },
+				],
+			},
+			{
+				value: "__toggle_failover__",
+				label: "故障自动转移",
+				valueBadge: boolText(config.health.autoFailover),
+				valueTone: boolTone(config.health.autoFailover),
+				detailTitle: "故障自动转移",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.health.autoFailover), tone: boolTone(config.health.autoFailover) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "请求遇到可重试故障时自动切换至下一个健康备用模型。", tone: "text" },
+				],
+			},
+			{
+				value: "__cooldown__",
+				label: "基础冷却时长",
+				valueBadge: `${config.health.cooldownSeconds}s`,
+				valueTone: "text",
+				detailTitle: "基础冷却时长",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: `${config.health.cooldownSeconds}s`, tone: "text" },
+					{ kind: "kv", key: "范围", value: "5 ~ 3600 秒", tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "模型首次故障后进入冷却的初始时长。", tone: "muted" },
+				],
+			},
+			{
+				value: "__max_cooldown__",
+				label: "最大冷却时长",
+				valueBadge: `${config.health.maxCooldownSeconds}s`,
+				valueTone: "text",
+				detailTitle: "最大冷却时长",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: `${config.health.maxCooldownSeconds}s`, tone: "text" },
+					{ kind: "kv", key: "范围", value: `${config.health.cooldownSeconds} ~ 86400 秒`, tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "连续故障指数退避与认证错误冷却的上限时长。", tone: "muted" },
+				],
+			},
+			{
+				value: "__scope__",
+				label: "保存位置",
+				valueBadge: scopeLabel(activeScopeRef.value),
+				valueTone: "accent",
+				detailTitle: "配置保存层级",
+				detailEntries: [
+					{ kind: "kv", key: "写入目标", value: scopeLabel(activeScopeRef.value), tone: "accent" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 切换全局或项目配置" },
+				],
+			},
+			...snapshots.map((s): MenuPanelItem => {
+				const badgeText =
+					s.status === "healthy"
+						? "健康"
+						: s.status === "cooldown"
+							? `冷却 ${formatDurationSeconds(s.remainingCooldownMs)}`
+							: `待恢复 (${s.consecutiveFailures})`;
+				const badgeTone: DetailTone = s.status === "healthy" ? "success" : "warning";
+				return {
+					value: `reset:${s.key}`,
+					label: s.key,
+					valueBadge: badgeText,
+					valueTone: badgeTone,
+					detailTitle: s.key,
+					detailEntries: [
+						{ kind: "kv", key: "状态", value: badgeText, tone: badgeTone },
+						{ kind: "kv", key: "连续失败", value: `${s.consecutiveFailures} 次`, tone: s.consecutiveFailures > 0 ? "warning" : "muted" },
+						...(s.lastSummary ? [{ kind: "kv" as const, key: "最近故障", value: s.lastSummary, tone: "muted" as const }] : []),
+						{ kind: "spacer" },
+						{ kind: "hint", text: s.status === "healthy" ? "当前状态健康（按 Enter 可重置计数）" : "Enter 立即重置该模型健康状态" },
+					],
+				};
+			}),
+		];
 
 		const picked = await selectMenuPanel(ctx, {
 			title: "模型健康与冷却管理",
-			detailTitle: "模型健康快照",
-			details: text,
-			items: [
-				...resetModelOptions,
-				resetAllOption,
-				toggleHealthOption,
-				toggleFailoverOption,
-				cooldownOption,
-				maxCooldownOption,
-				scopeOption,
-			],
+			headerBadge: buildHeaderBadge(config, activeScopeRef.value),
+			detailTitle: "健康总览",
+			detailEntries: overviewEntries,
+			items,
+			initialValue: lastPickedId,
+			bodyRows: 10,
 		});
 		if (!picked) return;
+		lastPickedId = picked;
 
-		if (picked === scopeOption) {
+		if (picked === "__scope__") {
 			activeScopeRef.value = activeScopeRef.value === "project" ? "global" : "project";
 			continue;
 		}
-		if (picked === resetAllOption) {
+		if (picked === "__reset_all__") {
 			tracker.reset();
 			sendCommandOutput(ctx, "已重置全部模型健康状态。");
 			continue;
 		}
-		if (picked === toggleHealthOption) {
+		if (picked === "__toggle_health__") {
 			const nextEnabled = !config.health.enabled;
 			applyConfigPatch(
 				ctx,
@@ -1270,7 +1685,7 @@ async function openHealthManager(
 			);
 			continue;
 		}
-		if (picked === toggleFailoverOption) {
+		if (picked === "__toggle_failover__") {
 			const nextAuto = !config.health.autoFailover;
 			applyConfigPatch(
 				ctx,
@@ -1281,20 +1696,18 @@ async function openHealthManager(
 			);
 			continue;
 		}
-		if (picked === cooldownOption) {
+		if (picked === "__cooldown__") {
 			await promptCooldownSeconds(ctx, runtime, activeScopeRef.value);
 			continue;
 		}
-		if (picked === maxCooldownOption) {
+		if (picked === "__max_cooldown__") {
 			await promptMaxCooldownSeconds(ctx, runtime, activeScopeRef.value);
 			continue;
 		}
-
-		const resetIdx = resetModelOptions.indexOf(picked);
-		const target = resetIdx >= 0 ? degraded[resetIdx] : undefined;
-		if (target) {
-			tracker.reset(target.key);
-			sendCommandOutput(ctx, `已重置模型健康状态: ${target.key}`);
+		if (picked.startsWith("reset:")) {
+			const key = picked.slice(6);
+			tracker.reset(key);
+			sendCommandOutput(ctx, `已重置模型健康状态: ${key}`);
 		}
 	}
 }
@@ -1328,11 +1741,18 @@ async function handleHealth(ctx: ExtensionCommandContext, runtime: FusionCommand
 	sendCommandOutput(ctx, text);
 }
 
+interface DryRunTestResult {
+	text: string;
+	lines: string[];
+	entries: DetailEntry[];
+	level: "info" | "warning";
+}
+
 async function executeDryRunTest(
 	ctx: ExtensionCommandContext,
 	runtime: FusionCommandRuntime,
 	promptText: string,
-): Promise<{ text: string; lines: string[]; level: "info" | "warning" }> {
+): Promise<DryRunTestResult> {
 	const config = runtime.getLoadedConfig().config;
 	const pool = buildCandidatePool({
 		modelRegistry: ctx.modelRegistry,
@@ -1342,13 +1762,13 @@ async function executeDryRunTest(
 
 	if (pool.forDecision.length === 0) {
 		const msg = "没有可用于测试的候选模型。";
-		return { text: msg, lines: [msg], level: "warning" };
+		return { text: msg, lines: [msg], entries: [{ kind: "text", text: msg, tone: "warning" }], level: "warning" };
 	}
 
 	const classifiers = await resolveClassifierChain(ctx.modelRegistry, config.classifier);
 	if (classifiers.length === 0) {
 		const msg = "未检测到可用的专用分类器模型。";
-		return { text: msg, lines: [msg], level: "warning" };
+		return { text: msg, lines: [msg], entries: [{ kind: "text", text: msg, tone: "warning" }], level: "warning" };
 	}
 
 	const samplePrompt = promptText.trim() || DEFAULT_TEST_PROMPT;
@@ -1374,7 +1794,7 @@ async function executeDryRunTest(
 
 	if (!decision) {
 		const msg = "分类器测试调用失败或超时，请检查网络连接与凭据。";
-		return { text: msg, lines: [msg], level: "warning" };
+		return { text: msg, lines: [msg], entries: [{ kind: "text", text: msg, tone: "warning" }], level: "warning" };
 	}
 
 	const matched = pool.forDecision.find((c) => c.key === decision.selectedModelKey);
@@ -1388,14 +1808,21 @@ async function executeDryRunTest(
 			})
 		: decision.effortLabel;
 
+	const confidencePct = Math.round(decision.selectedModelConfidence * 100);
 	const lines = [
 		`干跑路由测试结果:`,
 		`测试输入: ${samplePrompt}`,
 		`分类器: ${decision.classifierModelKey} (${decision.latencyMs}ms)`,
-		`推荐模型: ${decision.selectedModelKey} (置信度 ${Math.round(decision.selectedModelConfidence * 100)}%)`,
+		`推荐模型: ${decision.selectedModelKey} (置信度 ${confidencePct}%)`,
 		`思考强度: ${decision.effortLabel} → 适配后 ${resolvedThinking}`,
 	];
-	return { text: lines.join("\n"), lines, level: "info" };
+	const entries: DetailEntry[] = [
+		{ kind: "kv", key: "推荐模型", value: `${decision.selectedModelKey} (${confidencePct}%)`, tone: "success" },
+		{ kind: "kv", key: "思考强度", value: `${decision.effortLabel} → ${resolvedThinking}`, tone: "accent" },
+		{ kind: "kv", key: "分类器", value: `${decision.classifierModelKey} (${decision.latencyMs}ms)`, tone: "muted" },
+		{ kind: "kv", key: "测试输入", value: samplePrompt, tone: "text" },
+	];
+	return { text: lines.join("\n"), lines, entries, level: "info" };
 }
 
 async function handleTest(ctx: ExtensionCommandContext, runtime: FusionCommandRuntime, promptText: string): Promise<void> {
@@ -1430,14 +1857,14 @@ async function openSettingsFromRuntime(
 }
 
 /**
- * 打开 /fusion 横向分区双栏路由控制中心：
- * 分为「概览与诊断」「路由策略」「模型与分类器」「健康与测试」4 个横向标签页，
- * 左栏放置紧凑操作与配置项，右栏实时展示当前分区/选中项的完整状态与配置详情。
+ * 打开 /fusion 固定高度横向分区双栏路由控制中心：
+ * 分为「概览与诊断」「路由策略」「模型与分类器」「健康与测试」4 个标签页，
+ * 列表高度与布局骨架严格固定，右栏仅展示当前选中项的结构化重点信息。
  */
 async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionCommandRuntime): Promise<void> {
 	const scopeRef: ScopeRef = { value: defaultSaveScope(runtime) };
 	let cachedClassifiers: DiscoveredClassifier[] = [];
-	let lastTestLines: string[] | undefined;
+	let lastTestResult: DryRunTestResult | undefined;
 
 	const refreshClassifiers = async (): Promise<void> => {
 		cachedClassifiers = await resolveClassifierChain(
@@ -1451,7 +1878,7 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 		const rawPrompt = await ctx.ui.input("输入干跑测试任务描述（直接回车使用默认示例）", DEFAULT_TEST_PROMPT);
 		if (rawPrompt === undefined) return;
 		const res = await executeDryRunTest(ctx, runtime, rawPrompt);
-		lastTestLines = res.lines;
+		lastTestResult = res;
 		sendCommandOutput(ctx, res.text, res.level);
 	};
 
@@ -1467,49 +1894,82 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			currentModelKey: state?.selectedModel,
 		});
 
-		const statusLines = buildStatusLinesFromChain(ctx, runtime, cachedClassifiers).slice(1);
-		const rawExplainLines = buildExplainLines(state);
-		const explainLines = rawExplainLines.length > 1 ? rawExplainLines.slice(1) : rawExplainLines;
-		const modelsLines = buildModelsOverviewLines(ctx, config, healthTracker);
-		const classifierLines = buildClassifierLinesFromChain(config, cachedClassifiers);
+		const explainEntries = buildExplainDetailEntries(state);
+		const modelsEntries = buildModelsSummaryEntries(ctx, config, healthTracker);
 		const healthReport = buildHealthReport(ctx, runtime);
 		const degradedSnapshots = healthReport.snapshots.filter((s) => s.status !== "healthy");
-		const coolingCount = degradedSnapshots.filter((s) => s.status === "cooldown").length;
-
-		const stateSummary = state ? `${state.selectedModel} • ${state.thinkingLevel}` : "尚未路由";
-		const classifierSummary = cachedClassifiers[0]?.key ?? "未检测到分类器";
+		const coolingSnapshots = degradedSnapshots.filter((s) => s.status === "cooldown");
+		const coolingCount = coolingSnapshots.length;
 		const availableCount = pool.allResolved.length - coolingCount;
 
-		const policySummaryLines = [
-			`思考强度模式：${config.thinkingMode}`,
-			`工具循环粘性保持：${boolText(config.redecision.stickyDuringToolLoop)}`,
-			`新消息重新决策：${boolText(config.redecision.redecideOnTaskShift)}`,
-			`思考签名保护：${boolText(config.redecision.protectThinkingSignature)}`,
-			`连续工具报错阈值：${config.redecision.redecideOnConsecutiveToolErrors}`,
-			`周期复查步数：${config.redecision.periodicReviewSteps}`,
-			`切换收益最低置信度：${config.redecision.minSwitchBenefitConfidence}`,
-			`备用模型回退链：${config.fallbackChain.length > 0 ? config.fallbackChain.join(" → ") : "未设置"}`,
-			"",
-			`路由偏好说明：`,
-			config.preferences || "未设置",
+		const stateSummary = state ? `${shortModelLabel(state.selectedModel)} (${state.thinkingLevel})` : "待命";
+		const primaryClassifier = cachedClassifiers[0]?.key;
+		const classifierSummary = primaryClassifier ? shortModelLabel(primaryClassifier) : "未检测到";
+		const customTarget = resolveCustomClassifierTarget(config.classifier);
+
+		// 顶栏固定单行关键指标（绝不折行）
+		const summarySegments: SummarySegment[] = [
+			{ label: "路由", value: stateSummary, tone: state ? "accent" : "muted" },
+			{ label: "分类器", value: classifierSummary, tone: primaryClassifier ? "text" : "warning" },
+			{
+				label: "候选池",
+				value: coolingCount > 0 ? `${availableCount}/${pool.allResolved.length} (冷却 ${coolingCount})` : `${availableCount}/${pool.allResolved.length} 可用`,
+				tone: coolingCount > 0 ? "warning" : "success",
+			},
 		];
 
-		const errValues = Array.from(
-			new Set(["0", "1", "2", "3", "4", "5", String(config.redecision.redecideOnConsecutiveToolErrors)]),
-		);
-		const stepValues = Array.from(
-			new Set(["0", "4", "8", "12", "16", "24", String(config.redecision.periodicReviewSteps)]),
-		);
+		// 概览右栏精简状态卡片（不重复大段路径，突出冷却与当前状态）
+		const overviewEntries: DetailEntry[] = [
+			{
+				kind: "kv",
+				key: "运行状态",
+				value: config.enabled ? `已启用 · ${config.mode}` : "已停用",
+				tone: !config.enabled ? "dim" : config.mode === "observe" ? "warning" : "success",
+			},
+			{ kind: "kv", key: "虚拟模型", value: `${config.virtualModel.provider}/${config.virtualModel.id}`, tone: "muted" },
+			{
+				kind: "kv",
+				key: "当前路由",
+				value: state ? `${state.selectedModel} (${state.thinkingLevel})` : "尚未路由",
+				tone: state ? "accent" : "dim",
+			},
+			{
+				kind: "kv",
+				key: "分类器",
+				value: primaryClassifier
+					? `${primaryClassifier}${cachedClassifiers.length > 1 ? ` (+${cachedClassifiers.length - 1})` : ""}`
+					: "未检测到可用分类器",
+				tone: primaryClassifier ? "text" : "warning",
+			},
+			{
+				kind: "kv",
+				key: "候选池",
+				value: `${availableCount}/${pool.allResolved.length} 可用${pool.discoveredFromRegistry ? " (自动发现)" : ""}`,
+				tone: coolingCount > 0 ? "warning" : "success",
+			},
+			...coolingSnapshots.slice(0, 2).map((s): DetailEntry => ({
+				kind: "kv",
+				key: "冷却中",
+				value: `${s.key} (${formatDurationSeconds(s.remainingCooldownMs)})`,
+				tone: "warning",
+			})),
+		];
 
-		// ── 分区 1：概览与诊断 ──
+		const errCount = config.redecision.redecideOnConsecutiveToolErrors;
+		const reviewSteps = config.redecision.periodicReviewSteps;
+		const errValues = Array.from(new Set(["0", "1", "2", "3", "4", "5", String(errCount)]));
+		const stepValues = Array.from(new Set(["0", "4", "8", "12", "16", "24", String(reviewSteps)]));
+
+		// ── 分区 1：概览与诊断（固定 5 项）──
 		const overviewItems: WorkspaceItem[] = [
 			{
 				id: "enabled",
 				label: "路由器总开关",
 				value: boolText(config.enabled),
+				valueTone: boolTone(config.enabled),
 				allowSpace: true,
 				detailTitle: "路由状态概览",
-				detailLines: statusLines,
+				detailEntries: [...overviewEntries, { kind: "spacer" }, { kind: "hint", text: "Space / Enter 启停动态路由" }],
 				onActivate: () => {
 					const next = !config.enabled;
 					applyConfigPatch(
@@ -1525,9 +1985,17 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "mode",
 				label: "运行模式",
 				value: config.mode,
+				valueTone: config.mode === "observe" ? "warning" : "success",
 				allowSpace: true,
-				detailTitle: "路由状态概览",
-				detailLines: statusLines,
+				detailTitle: "运行模式",
+				detailEntries: [
+					{ kind: "kv", key: "当前模式", value: config.mode, tone: config.mode === "observe" ? "warning" : "success" },
+					{ kind: "spacer" },
+					{ kind: "kv", key: "auto", value: "按分类器决策自动派发物理模型与思考深度", tone: "text" },
+					{ kind: "kv", key: "observe", value: "仅记录推荐结果，实际派发默认回退模型", tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换模式" },
+				],
 				onActivate: () => {
 					const nextMode: FusionRouterConfig["mode"] = config.mode === "auto" ? "observe" : "auto";
 					applyConfigPatch(
@@ -1542,17 +2010,20 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			{
 				id: "explain",
 				label: "最近一次决策详情",
-				value: state ? state.lastDecision.trigger : "暂无记录",
+				value: state ? state.lastDecision.trigger : "暂无",
+				valueTone: state ? "text" : "dim",
 				detailTitle: "最近决策诊断",
-				detailLines: explainLines,
+				detailEntries: explainEntries,
 				onActivate: async () => {
 					const testOpt = "执行干跑路由测试";
 					const backOpt = "返回控制中心";
 					const picked = await selectMenuPanel(ctx, {
 						title: "最近一次路由决策详情",
+						headerBadge: buildHeaderBadge(config, scopeRef.value),
 						detailTitle: "决策诊断",
-						details: explainLines.join("\n"),
+						detailEntries: explainEntries,
 						items: [testOpt, backOpt],
+						bodyRows: 8,
 					});
 					if (picked === testOpt) {
 						await runPromptDryTest();
@@ -1563,8 +2034,17 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "reload",
 				label: "重新加载配置文件",
 				value: loaded.projectExists ? "全局+项目" : "全局",
-				detailTitle: "配置文件状态",
-				detailLines: statusLines,
+				valueTone: "muted",
+				detailTitle: "配置文件层级",
+				detailEntries: [
+					{ kind: "kv", key: "生效层级", value: loaded.projectExists ? "项目配置覆盖全局配置" : "仅全局配置", tone: "text" },
+					{ kind: "kv", key: "全局配置", value: loaded.globalExists ? "已存在" : "未创建", tone: loaded.globalExists ? "success" : "dim" },
+					{ kind: "text", text: loaded.globalPath, tone: "dim" },
+					{ kind: "kv", key: "项目配置", value: loaded.projectExists ? "已存在" : "未创建", tone: loaded.projectExists ? "success" : "dim" },
+					{ kind: "text", text: loaded.projectPath, tone: "dim" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 重新读取磁盘配置并刷新分类器链" },
+				],
 				onActivate: async () => {
 					reloadConfiguration(ctx, runtime);
 					await refreshClassifiers();
@@ -1574,12 +2054,21 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "saveScope",
 				label: "配置保存位置",
 				value: scopeLabel(scopeRef.value),
+				valueTone: "accent",
 				allowSpace: true,
-				detailTitle: "配置保存层级",
-				detailLines: [
-					`当前写入目标：${scopeLabel(scopeRef.value)}`,
-					`全局配置路径：${loaded.globalPath}${loaded.globalExists ? " [存在]" : " [未创建]"}`,
-					`项目配置路径：${loaded.projectPath}${loaded.projectExists ? " [存在]" : " [未创建]"}`,
+				detailTitle: "配置写入目标",
+				detailEntries: [
+					{ kind: "kv", key: "写入目标", value: scopeLabel(scopeRef.value), tone: "accent" },
+					{
+						kind: "kv",
+						key: "目标路径",
+						value: scopeRef.value === "project" ? loaded.projectPath : loaded.globalPath,
+						tone: "muted",
+					},
+					{ kind: "spacer" },
+					{ kind: "text", text: "仅写入本次修改的字段至目标层级，保持另一层级文件不变。", tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换全局或项目层" },
 				],
 				onActivate: () => {
 					scopeRef.value = scopeRef.value === "project" ? "global" : "project";
@@ -1587,32 +2076,49 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			},
 		];
 
-		// ── 分区 2：路由策略 ──
-		const makePolicyToggle = (params: {
+		// ── 分区 2：路由策略（固定 9 项，每项右栏仅聚焦当前项说明与详情）──
+		const makePolicyItem = (params: {
 			id: string;
 			label: string;
 			value: string;
+			valueTone?: DetailTone;
 			desc: string;
+			extra?: DetailEntry[];
+			hint?: string;
 			allowSpace?: boolean;
 			run: () => void | Promise<void>;
 		}): WorkspaceItem => ({
 			id: params.id,
 			label: params.label,
 			value: params.value,
+			valueTone: params.valueTone,
 			allowSpace: params.allowSpace ?? true,
 			detailTitle: params.label,
-			detailLines: [params.desc, "", "── 当前策略总览 ──", ...policySummaryLines],
+			detailEntries: [
+				{ kind: "kv", key: "当前值", value: params.value, tone: params.valueTone ?? "text" },
+				{ kind: "spacer" },
+				{ kind: "text", text: params.desc, tone: "text" },
+				...(params.extra ? [{ kind: "spacer" as const }, ...params.extra] : []),
+				{ kind: "spacer" },
+				{ kind: "hint", text: params.hint ?? "Space / Enter 切换" },
+			],
 			onActivate: async () => {
 				await params.run();
 			},
 		});
 
 		const policyItems: WorkspaceItem[] = [
-			makePolicyToggle({
+			makePolicyItem({
 				id: "thinkingMode",
 				label: "思考强度模式",
 				value: config.thinkingMode,
-				desc: "auto 由分类器决定；passthrough 透传当前选择；profile-default 使用模型默认档位。",
+				valueTone: "text",
+				desc: "控制目标模型推理档位的决策方式。",
+				extra: [
+					{ kind: "kv", key: "auto", value: "由分类器按任务难度决定", tone: "muted" },
+					{ kind: "kv", key: "passthrough", value: "透传 Pi 当前选择的档位", tone: "muted" },
+					{ kind: "kv", key: "profile", value: "采用目标模型默认思考档位", tone: "muted" },
+				],
 				run: () => {
 					const next = cycleString(config.thinkingMode, ["auto", "passthrough", "profile-default"] as const);
 					applyConfigPatch(
@@ -1624,11 +2130,12 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "stickyDuringToolLoop",
 				label: "工具循环粘性保持",
 				value: boolText(config.redecision.stickyDuringToolLoop),
-				desc: "工具调用返回后优先保持当前模型，保护上下文缓存。",
+				valueTone: boolTone(config.redecision.stickyDuringToolLoop),
+				desc: "工具调用返回后优先保持当前模型，保护上下文缓存并减少无谓切换。",
 				run: () => {
 					const next = !config.redecision.stickyDuringToolLoop;
 					applyConfigPatch(
@@ -1640,11 +2147,12 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "redecideOnTaskShift",
 				label: "新消息重新决策",
 				value: boolText(config.redecision.redecideOnTaskShift),
-				desc: "收到新用户消息时重新评估模型；关闭后保持当前会话模型。",
+				valueTone: boolTone(config.redecision.redecideOnTaskShift),
+				desc: "收到新用户消息时重新评估模型；关闭后整段会话沿用当前模型。",
 				run: () => {
 					const next = !config.redecision.redecideOnTaskShift;
 					applyConfigPatch(
@@ -1656,11 +2164,13 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "protectThinkingSignature",
 				label: "思考签名保护",
 				value: boolText(config.redecision.protectThinkingSignature),
-				desc: "当前轮次已产生思考内容时避免切换模型，保留完整推理上下文。",
+				valueTone: boolTone(config.redecision.protectThinkingSignature),
+				desc: "本轮已产生思考块时锁定周期复查，防止跨模型切换丢弃推理签名。",
+				extra: [{ kind: "text", text: "连续工具报错达到阈值时仍允许切出升级。", tone: "muted" }],
 				run: () => {
 					const next = !config.redecision.protectThinkingSignature;
 					applyConfigPatch(
@@ -1672,13 +2182,15 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "redecideOnConsecutiveToolErrors",
 				label: "连续工具报错阈值",
-				value: String(config.redecision.redecideOnConsecutiveToolErrors),
-				desc: "连续多少次工具报错后触发重新选路（0 表示关闭）。",
+				value: errCount > 0 ? `${errCount} 次` : "关闭",
+				valueTone: errCount > 0 ? "text" : "dim",
+				desc: "连续工具报错达到该次数后，触发分类器重新选路或升级模型。",
+				extra: [{ kind: "kv", key: "可循环值", value: "0(关) · 1 · 2 · 3 · 4 · 5", tone: "muted" }],
 				run: () => {
-					const next = Number(cycleString(String(config.redecision.redecideOnConsecutiveToolErrors), errValues));
+					const next = Number(cycleString(String(errCount), errValues));
 					applyConfigPatch(
 						ctx,
 						runtime,
@@ -1688,13 +2200,15 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "periodicReviewSteps",
 				label: "周期复查步数",
-				value: String(config.redecision.periodicReviewSteps),
-				desc: "工具循环每执行多少步重新评估一次模型（0 表示关闭）。",
+				value: reviewSteps > 0 ? `${reviewSteps} 步` : "关闭",
+				valueTone: reviewSteps > 0 ? "text" : "dim",
+				desc: "连续工具执行每满指定步数时触发一次周期复查，评估是否需切换模型。",
+				extra: [{ kind: "kv", key: "可循环值", value: "0(关) · 4 · 8 · 12 · 16 · 24", tone: "muted" }],
 				run: () => {
-					const next = Number(cycleString(String(config.redecision.periodicReviewSteps), stepValues));
+					const next = Number(cycleString(String(reviewSteps), stepValues));
 					applyConfigPatch(
 						ctx,
 						runtime,
@@ -1704,12 +2218,15 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "minSwitchBenefitConfidence",
 				label: "切换收益最低置信度",
 				value: String(config.redecision.minSwitchBenefitConfidence),
+				valueTone: "text",
 				allowSpace: false,
-				desc: "会话已有健康模型时，切换收益评估达到该置信度（0~1）才执行切换。",
+				desc: "会话已有健康模型时，切换收益评估达到该置信度才执行模型切换。",
+				extra: [{ kind: "kv", key: "取值范围", value: "0 ~ 1（越高越倾向保持当前模型）", tone: "muted" }],
+				hint: "Enter 输入新数值",
 				run: async () => {
 					const raw = await ctx.ui.input(
 						"切换收益最低置信度（0~1）",
@@ -1730,12 +2247,18 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "preferences",
 				label: "编辑路由偏好说明",
 				value: config.preferences ? "已设置" : "未设置",
+				valueTone: config.preferences ? "success" : "dim",
 				allowSpace: false,
-				desc: "向决策分类器补充自定义选路偏好说明（留空保存可清空）。",
+				desc: "附加给决策分类器的自然语言选路偏好说明。",
+				extra: [
+					{ kind: "heading", text: "当前内容" },
+					{ kind: "text", text: config.preferences || "未设置", tone: config.preferences ? "text" : "dim" },
+				],
+				hint: "Enter 打开编辑器修改（留空清空）",
 				run: async () => {
 					const edited = await ctx.ui.editor("路由偏好说明（留空保存表示清空）", config.preferences);
 					if (edited === undefined) return;
@@ -1752,12 +2275,22 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 					);
 				},
 			}),
-			makePolicyToggle({
+			makePolicyItem({
 				id: "fallbackChain",
 				label: "编辑备用模型回退链",
 				value: config.fallbackChain.length > 0 ? `${config.fallbackChain.length} 个` : "未设置",
+				valueTone: config.fallbackChain.length > 0 ? "success" : "dim",
 				allowSpace: false,
 				desc: "分类器不可用或默认模型冷却时，按顺序尝试的备用物理模型链。",
+				extra:
+					config.fallbackChain.length > 0
+						? config.fallbackChain.slice(0, 4).map((m, i): DetailEntry => ({
+								kind: "bullet",
+								label: `${i + 1}. ${m}`,
+								tone: "text",
+							}))
+						: [{ kind: "text", text: "当前未设置自定义回退链（按候选优先级自动回退）。", tone: "dim" }],
+				hint: "Enter 编辑模型列表",
 				run: async () => {
 					const raw = await ctx.ui.input(
 						"备用模型回退链（多个 provider/model 用逗号或空格分隔，留空表示清空）",
@@ -1787,15 +2320,50 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			}),
 		];
 
-		// ── 分区 3：模型与分类器 ──
-		const customTarget = resolveCustomClassifierTarget(config.classifier);
+		// ── 分区 3：模型与分类器（固定 7 项，每项右栏聚焦自身状态）──
+		const classifierChainEntries: DetailEntry[] = [
+			{ kind: "kv", key: "当前配置", value: formatClassifierChoice(config), tone: "accent" },
+			{ kind: "spacer" },
+			...(cachedClassifiers.length === 0
+				? [{ kind: "text" as const, text: "未检测到已配置凭据的专用决策分类器。", tone: "warning" as const }]
+				: [
+						{ kind: "heading" as const, text: `生效链 (${cachedClassifiers.length})` },
+						...cachedClassifiers.slice(0, 4).map((c, idx): DetailEntry => ({
+							kind: "bullet",
+							label: `${idx + 1}. ${c.key}`,
+							value: c.source,
+							tone: idx === 0 ? "success" : "dim",
+						})),
+					]),
+		];
+
+		const endpointEntries: DetailEntry[] = customTarget
+			? [
+					{ kind: "kv", key: "状态", value: "已配置", tone: "success" },
+					{ kind: "kv", key: "地址", value: customTarget.baseUrl, tone: "text" },
+					{ kind: "kv", key: "协议", value: customTarget.api, tone: "muted" },
+					{ kind: "kv", key: "模型", value: customTarget.modelId, tone: "muted" },
+					{
+						kind: "kv",
+						key: "密钥变量",
+						value: config.classifier.customEndpoint?.apiKeyEnv || "默认环境变量",
+						tone: "dim",
+					},
+				]
+			: [
+					{ kind: "kv", key: "状态", value: "未配置", tone: "dim" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "可配置兼容的自定义决策端点地址、协议类型与密钥环境变量。", tone: "muted" },
+				];
+
 		const modelsAndClassifierItems: WorkspaceItem[] = [
 			{
 				id: "manageModels",
 				label: "管理候选物理模型池",
 				value: `${pool.allResolved.length} 个${pool.discoveredFromRegistry ? "(自动)" : ""}`,
+				valueTone: "text",
 				detailTitle: "候选物理模型池",
-				detailLines: modelsLines,
+				detailEntries: [...modelsEntries, { kind: "spacer" }, { kind: "hint", text: "Enter 打开候选模型列表与画像编辑" }],
 				onActivate: async () => {
 					await openModelsManager(ctx, runtime, scopeRef);
 				},
@@ -1803,9 +2371,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			{
 				id: "importModels",
 				label: "导入已认证物理模型",
-				value: "回车导入",
+				value: "导入 ›",
+				valueTone: "muted",
 				detailTitle: "导入物理模型",
-				detailLines: modelsLines,
+				detailEntries: [
+					{ kind: "kv", key: "当前来源", value: pool.discoveredFromRegistry ? "自动发现" : `配置文件 (${config.models.length} 个)`, tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "将当前已配置凭据的物理模型写入配置文件，便于固定候选池并自定义场景画像。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: `Enter 导入至${scopeLabel(scopeRef.value)}` },
+				],
 				onActivate: () => {
 					importModels(ctx, runtime, scopeRef.value);
 				},
@@ -1813,9 +2388,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			{
 				id: "defaultModel",
 				label: "默认回退模型",
-				value: config.defaultModel ? (parseModelKey(config.defaultModel)?.id ?? config.defaultModel) : "按优先级",
-				detailTitle: "候选物理模型池",
-				detailLines: modelsLines,
+				value: config.defaultModel ? shortModelLabel(config.defaultModel) : "按优先级",
+				valueTone: config.defaultModel ? "accent" : "dim",
+				detailTitle: "默认回退模型",
+				detailEntries: [
+					{ kind: "kv", key: "当前设置", value: config.defaultModel ?? "未设置（按最高优先级选取）", tone: config.defaultModel ? "accent" : "muted" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "在分类器不可用、路由停用或 observe 模式下派发的兜底物理模型。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 选择或清除默认模型" },
+				],
 				onActivate: async () => {
 					await promptSelectDefaultModel(ctx, runtime, scopeRef.value);
 				},
@@ -1823,9 +2405,10 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			{
 				id: "selectClassifier",
 				label: "专用决策分类器",
-				value: formatClassifierChoice(config),
-				detailTitle: "决策分类器与可用链",
-				detailLines: classifierLines,
+				value: config.classifier.provider === "auto" ? "auto" : shortModelLabel(formatClassifierChoice(config)),
+				valueTone: primaryClassifier ? "text" : "warning",
+				detailTitle: "决策分类器链",
+				detailEntries: [...classifierChainEntries, { kind: "spacer" }, { kind: "hint", text: "Enter 选择指定分类器或切换 auto" }],
 				onActivate: async () => {
 					const current = formatClassifierChoice(config);
 					const choices = Array.from(new Set(["auto", ...cachedClassifiers.map((c) => c.key)]));
@@ -1854,8 +2437,9 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "customEndpoint",
 				label: "配置自定义决策端点",
 				value: customTarget ? "已配置" : "未配置",
+				valueTone: customTarget ? "success" : "dim",
 				detailTitle: "自定义决策端点",
-				detailLines: classifierLines,
+				detailEntries: [...endpointEntries, { kind: "spacer" }, { kind: "hint", text: "Enter 配置端点地址、协议与密钥变量" }],
 				onActivate: async () => {
 					await configureCustomEndpointInteractive(ctx, runtime, scopeRef.value);
 					await refreshClassifiers();
@@ -1864,9 +2448,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			{
 				id: "endpointActions",
 				label: "导入或清除分类器端点",
-				value: config.classifier.customEndpoint ? "导入/清除" : "从全局导入",
-				detailTitle: "分类器端点操作",
-				detailLines: classifierLines,
+				value: config.classifier.customEndpoint ? "导入/清除" : "导入 ›",
+				valueTone: "muted",
+				detailTitle: "端点快捷操作",
+				detailEntries: [
+					...endpointEntries.slice(0, 2),
+					{ kind: "spacer" },
+					{ kind: "text", text: "支持从 Pi 全局 settings.json 导入端点，或清除当前自定义端点。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 执行导入或清除" },
+				],
 				onActivate: async () => {
 					if (!config.classifier.customEndpoint) {
 						importClassifierEndpoint(ctx, runtime, scopeRef.value);
@@ -1889,8 +2480,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "classifierThresholds",
 				label: "分类器超时与最低置信度",
 				value: `${config.classifier.timeoutMs}ms / ${config.classifier.minConfidence}`,
-				detailTitle: "分类器参数",
-				detailLines: classifierLines,
+				valueTone: "text",
+				detailTitle: "分类器调用参数",
+				detailEntries: [
+					{ kind: "kv", key: "超时时间", value: `${config.classifier.timeoutMs} ms`, tone: "text" },
+					{ kind: "kv", key: "最低置信度", value: String(config.classifier.minConfidence), tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "超时自动降级至下一个备用分类器；置信度低于阈值时回退默认模型。", tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 调整超时或最低置信度" },
+				],
 				onActivate: async () => {
 					const tOpt = `修改超时时间（当前：${config.classifier.timeoutMs}ms）`;
 					const cOpt = `修改最低置信度（当前：${config.classifier.minConfidence}）`;
@@ -1904,34 +2503,49 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 			},
 		];
 
-		// ── 分区 4：健康与界面 ──
-		const healthAndUiLines = [
-			...healthReport.lines,
-			"",
-			"── 界面通知设置 ──",
-			`底部状态栏显示：${boolText(config.ui.showStatusBar)}`,
-			`切换模型通知：${boolText(config.ui.notifyOnSwitch)}`,
-			`故障转移通知：${boolText(config.ui.notifyOnFailover)}`,
-		];
-
-		const dryRunDetailLines = lastTestLines
-			? [...lastTestLines, "", "── 候选池状态 ──", ...healthReport.lines.slice(0, 6)]
+		// ── 分区 4：健康与测试（固定 8 项，每项右栏精准独立展示）──
+		const dryRunEntries: DetailEntry[] = lastTestResult
+			? [...lastTestResult.entries, { kind: "spacer" }, { kind: "hint", text: "Enter 重新输入任务测试" }]
 			: [
-					"按 Enter 输入任意任务描述，测试当前分类器选路与思考强度映射结果（不产生对话消息）。",
-					`默认测试示例：${DEFAULT_TEST_PROMPT}`,
-					"",
-					"── 当前分类器与候选池 ──",
-					`主分类器：${classifierSummary}`,
-					`可用候选模型：${availableCount}/${pool.allResolved.length} 个`,
+					{ kind: "text", text: "模拟一次路由选路与思考强度适配，不产生对话消息。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "kv", key: "主分类器", value: primaryClassifier ?? "未检测到", tone: primaryClassifier ? "muted" : "warning" },
+					{ kind: "kv", key: "可用候选", value: `${availableCount}/${pool.allResolved.length} 个`, tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 输入任务描述开始测试" },
 				];
+
+		const healthSnapshotEntries: DetailEntry[] = [
+			{
+				kind: "kv",
+				key: "异常模型",
+				value: degradedSnapshots.length > 0 ? `${degradedSnapshots.length}/${healthReport.snapshots.length} 个` : "全部健康",
+				tone: degradedSnapshots.length > 0 ? "warning" : "success",
+			},
+			{ kind: "spacer" },
+			...(degradedSnapshots.length > 0
+				? degradedSnapshots.slice(0, 4).map((s): DetailEntry => ({
+						kind: "bullet",
+						label: s.key,
+						value:
+							s.status === "cooldown"
+								? `冷却 ${formatDurationSeconds(s.remainingCooldownMs)}`
+								: `待恢复 (${s.consecutiveFailures}次)`,
+						tone: "warning",
+					}))
+				: [{ kind: "text" as const, text: "当前所有候选物理模型运行健康，无冷却记录。", tone: "success" as const }]),
+			{ kind: "spacer" },
+			{ kind: "hint", text: degradedSnapshots.length > 0 ? "Enter 选择重置单个或全部模型" : "Enter 重置全部健康记录" },
+		];
 
 		const healthAndTestItems: WorkspaceItem[] = [
 			{
 				id: "dryRunTest",
 				label: "执行干跑路由测试",
-				value: lastTestLines ? "查看/重测" : "回车测试",
+				value: lastTestResult ? "重测 ›" : "运行 ›",
+				valueTone: "accent",
 				detailTitle: "干跑路由测试",
-				detailLines: dryRunDetailLines,
+				detailEntries: dryRunEntries,
 				onActivate: async () => {
 					await runPromptDryTest();
 				},
@@ -1940,8 +2554,9 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "resetHealth",
 				label: "重置模型健康冷却",
 				value: degradedSnapshots.length > 0 ? `${degradedSnapshots.length} 个异常` : "全部健康",
-				detailTitle: "模型健康与冷却",
-				detailLines: healthAndUiLines,
+				valueTone: degradedSnapshots.length > 0 ? "warning" : "success",
+				detailTitle: "模型健康状态",
+				detailEntries: healthSnapshotEntries,
 				onActivate: async () => {
 					if (degradedSnapshots.length === 0) {
 						healthTracker.reset();
@@ -1972,9 +2587,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "healthEnabled",
 				label: "健康冷却追踪",
 				value: boolText(config.health.enabled),
+				valueTone: boolTone(config.health.enabled),
 				allowSpace: true,
-				detailTitle: "模型健康与冷却",
-				detailLines: healthAndUiLines,
+				detailTitle: "健康冷却追踪",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.health.enabled), tone: boolTone(config.health.enabled) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "记录限流、超时、上游不可用等故障，并对异常模型执行指数退避冷却。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换开关" },
+				],
 				onActivate: () => {
 					const next = !config.health.enabled;
 					applyConfigPatch(
@@ -1990,9 +2612,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "autoFailover",
 				label: "故障自动转移",
 				value: boolText(config.health.autoFailover),
+				valueTone: boolTone(config.health.autoFailover),
 				allowSpace: true,
-				detailTitle: "模型健康与冷却",
-				detailLines: healthAndUiLines,
+				detailTitle: "故障自动转移",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.health.autoFailover), tone: boolTone(config.health.autoFailover) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "请求遇到可重试上游故障时自动切换至下一个健康候选模型。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换开关" },
+				],
 				onActivate: () => {
 					const next = !config.health.autoFailover;
 					applyConfigPatch(
@@ -2008,8 +2637,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "cooldownRange",
 				label: "修改冷却时长范围",
 				value: `${config.health.cooldownSeconds}s~${config.health.maxCooldownSeconds}s`,
+				valueTone: "text",
 				detailTitle: "退避冷却时长",
-				detailLines: healthAndUiLines,
+				detailEntries: [
+					{ kind: "kv", key: "基础冷却", value: `${config.health.cooldownSeconds} 秒`, tone: "text" },
+					{ kind: "kv", key: "最大冷却", value: `${config.health.maxCooldownSeconds} 秒`, tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "text", text: "连续故障按指数退避增长冷却时长，直至达到上限。", tone: "muted" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Enter 调整基础或最大冷却秒数" },
+				],
 				onActivate: async () => {
 					const baseOpt = `修改基础冷却时长（当前：${config.health.cooldownSeconds}s）`;
 					const maxOpt = `修改最大冷却时长（当前：${config.health.maxCooldownSeconds}s）`;
@@ -2025,9 +2662,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "showStatusBar",
 				label: "底部状态栏显示",
 				value: boolText(config.ui.showStatusBar),
+				valueTone: boolTone(config.ui.showStatusBar),
 				allowSpace: true,
-				detailTitle: "界面通知与状态栏",
-				detailLines: healthAndUiLines,
+				detailTitle: "底部状态栏",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.ui.showStatusBar), tone: boolTone(config.ui.showStatusBar) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "在 Pi 底部状态栏显示当前路由派发的物理模型与思考深度。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换开关" },
+				],
 				onActivate: () => {
 					const next = !config.ui.showStatusBar;
 					applyConfigPatch(
@@ -2043,9 +2687,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "notifyOnSwitch",
 				label: "切换模型通知",
 				value: boolText(config.ui.notifyOnSwitch),
+				valueTone: boolTone(config.ui.notifyOnSwitch),
 				allowSpace: true,
-				detailTitle: "界面通知与状态栏",
-				detailLines: healthAndUiLines,
+				detailTitle: "切换模型通知",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.ui.notifyOnSwitch), tone: boolTone(config.ui.notifyOnSwitch) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "动态路由切换到另一物理模型时弹出提示通知。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换开关" },
+				],
 				onActivate: () => {
 					const next = !config.ui.notifyOnSwitch;
 					applyConfigPatch(
@@ -2061,9 +2712,16 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 				id: "notifyOnFailover",
 				label: "故障转移通知",
 				value: boolText(config.ui.notifyOnFailover),
+				valueTone: boolTone(config.ui.notifyOnFailover),
 				allowSpace: true,
-				detailTitle: "界面通知与状态栏",
-				detailLines: healthAndUiLines,
+				detailTitle: "故障转移通知",
+				detailEntries: [
+					{ kind: "kv", key: "当前值", value: boolText(config.ui.notifyOnFailover), tone: boolTone(config.ui.notifyOnFailover) },
+					{ kind: "spacer" },
+					{ kind: "text", text: "模型触发故障冷却并自动转移至备用模型时弹出告警通知。", tone: "text" },
+					{ kind: "spacer" },
+					{ kind: "hint", text: "Space / Enter 切换开关" },
+				],
 				onActivate: () => {
 					const next = !config.ui.notifyOnFailover;
 					applyConfigPatch(
@@ -2079,37 +2737,35 @@ async function openFusionHub(ctx: ExtensionCommandContext, runtime: FusionComman
 
 		return {
 			title: "Pi-Fusion 路由控制中心",
-			headerRight: `[${config.enabled ? `已启用 • ${config.mode}` : "已停用"}]  保存：${scopeLabel(scopeRef.value)}`,
-			bannerLines: [
-				`当前路由：${stateSummary}  │  分类器：${classifierSummary}  │  候选池：${availableCount}/${pool.allResolved.length} 可用`,
-			],
+			headerBadge: buildHeaderBadge(config, scopeRef.value),
+			summarySegments,
+			bodyRows: 10,
 			sections: [
 				{
 					id: "overview",
 					title: "概览与诊断",
 					detailTitle: "路由状态概览",
-					detailLines: statusLines,
+					detailEntries: overviewEntries,
 					items: overviewItems,
 				},
 				{
 					id: "policy",
 					title: "路由策略",
-					detailTitle: "当前策略总览",
-					detailLines: policySummaryLines,
+					detailTitle: "策略说明",
 					items: policyItems,
 				},
 				{
 					id: "models_classifier",
 					title: "模型与分类器",
-					detailTitle: "候选池与分类器",
-					detailLines: modelsLines,
+					detailTitle: "候选物理模型池",
+					detailEntries: modelsEntries,
 					items: modelsAndClassifierItems,
 				},
 				{
 					id: "health_test",
 					title: "健康与测试",
-					detailTitle: "模型健康与界面",
-					detailLines: healthAndUiLines,
+					detailTitle: "健康与测试",
+					detailEntries: healthSnapshotEntries,
 					items: healthAndTestItems,
 				},
 			],

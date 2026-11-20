@@ -553,7 +553,7 @@ describe("index 扩展集成与命令冒烟测试", () => {
 		assert.equal(health.cooldownSeconds, 120);
 	});
 
-	it("TUI 模式下横向分区双栏工作台利用横向空间、联动右栏详情并自适应窄屏", async () => {
+	it("TUI 模式下固定高度双栏工作台切页与移动光标高度恒定、右栏聚焦当前项并自适应窄屏", async () => {
 		writeProjectModels();
 		const h = createHarness(root, { withBranchState: true });
 		await h.startSession();
@@ -581,20 +581,26 @@ describe("index 扩展集成与命令冒烟测试", () => {
 				},
 			);
 
-			// 初始在分区 1「概览与诊断」：记录宽屏 100 列与窄屏 60 列渲染
+			// 分区 1 首项
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 按向下键两次选中「最近一次决策详情」，右栏应联动显示决策诊断
+			// 移至「最近一次决策详情」
 			comp.handleInput("\x1b[B");
 			comp.handleInput("\x1b[B");
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 按右方向键切换到分区 2「路由策略」，右栏应显示策略总览
+			// 切换至分区 2「路由策略」
 			comp.handleInput("\x1b[C");
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 按数字键 1 切回分区 1（光标保持在此前选中的第 3 项），上移两次回到首项「路由器总开关」，按空格切换后按 Esc 关闭
+			// 切换至分区 3「模型与分类器」与分区 4「健康与测试」
+			comp.handleInput("\x1b[C");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			comp.handleInput("\x1b[C");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			// 按数字键 1 切回分区 1，上移两次回到首项「路由器总开关」，按空格切换后再采样一次并按 Esc 关闭
 			comp.handleInput("1");
 			comp.handleInput("\x1b[A");
 			comp.handleInput("\x1b[A");
 			comp.handleInput(" ");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
 			if (!finished) comp.handleInput("\x1b");
 			return resolvedValue;
 		};
@@ -603,13 +609,20 @@ describe("index 扩展集成与命令冒烟测试", () => {
 
 		const firstWide = snapshots[0]!.wide;
 		const firstNarrow = snapshots[0]!.narrow;
-		// 宽屏包含 4 个横向分区标签与左右双栏竖向分隔线 │，且纵向紧凑、每行不超宽
+
+		// 切页、移动光标、切换开关后，宽屏与窄屏的总行数均严格恒定，零跳动
+		const wideHeights = new Set(snapshots.map((s) => s.wide.length));
+		const narrowHeights = new Set(snapshots.map((s) => s.narrow.length));
+		assert.equal(wideHeights.size, 1);
+		assert.equal(narrowHeights.size, 1);
+		assert.equal(firstWide.length, 18);
+
+		// 宽屏包含 4 个横向分区标签与左右双栏竖向分隔线 │，每行不超宽
 		assert.equal(firstWide.some((l) => l.includes("概览与诊断") && l.includes("路由策略") && l.includes("模型与分类器")), true);
 		assert.equal(firstWide.some((l) => l.includes("路由器总开关") && l.includes("│") && l.includes("路由状态概览")), true);
-		assert.equal(firstWide.length <= 22, true);
 		assert.equal(firstWide.every((l) => visibleWidth(l) <= 100), true);
 
-		// 窄屏自动退化为上下布局且每行不超过 60 列
+		// 窄屏自动退化为固定高度上下布局且每行不超过 60 列
 		assert.equal(firstNarrow.every((l) => visibleWidth(l) <= 60), true);
 		assert.equal(firstNarrow.some((l) => l.includes("路由器总开关") && l.includes("路由状态概览")), false);
 
@@ -618,13 +631,134 @@ describe("index 扩展集成与命令冒烟测试", () => {
 		assert.equal(secondWide.some((l) => l.includes("最近决策诊断")), true);
 		assert.equal(secondWide.some((l) => l.includes("restored")), true);
 
-		// 切到分区 2「路由策略」后，左栏展示策略项、右栏展示策略总览
+		// 切到分区 2「路由策略」后，右栏聚焦当前选中项「思考强度模式」说明，不再整页复读所有策略
 		const thirdWide = snapshots[2]!.wide;
 		assert.equal(thirdWide.some((l) => l.includes("思考强度模式") && l.includes("│")), true);
-		assert.equal(thirdWide.some((l) => l.includes("当前策略总览")), true);
+		assert.equal(thirdWide.some((l) => l.includes("passthrough")), true);
+		assert.equal(thirdWide.some((l) => l.includes("当前策略总览")), false);
 
 		// 空格切换总开关已保存生效
 		assert.equal(h.readJson(h.projectPath).enabled, false);
 		assert.equal(h.statusUpdates.at(-1), "Fusion: 已停用");
+	});
+
+	it("长列表 TUI 使用固定视口与锚定滚动，窗口内移动光标列表不跳动", async () => {
+		const h = createHarness(root);
+		const manyModels = Array.from({ length: 14 }, (_, i) =>
+			makeChatModel("openai", `model-${String(i + 1).padStart(2, "0")}`),
+		);
+		h.ctx.modelRegistry.getAvailable = () => manyModels;
+		h.ctx.modelRegistry.find = (p: string, id: string) => manyModels.find((m) => m.provider === p && m.id === id);
+		await h.startSession();
+
+		const frames: string[][] = [];
+		(h.ctx as unknown as { mode: string }).mode = "tui";
+		(h.ctx.ui as unknown as { custom: unknown }).custom = async (
+			factory: (
+				tui: { requestRender: () => void },
+				theme: { fg: (_c: string, s: string) => string; bold: (s: string) => string },
+				kb: unknown,
+				done: (result: unknown) => void,
+			) => { render: (w: number) => string[]; handleInput: (d: string) => void },
+		) => {
+			const comp = factory(
+				{ requestRender: () => {} },
+				{ fg: (_c: string, s: string) => s, bold: (s: string) => s },
+				{},
+				() => {},
+			);
+			// 初始选中第 1 项（索引 0）
+			frames.push(comp.render(100));
+			// 在 10 行固定视口内向下移动 5 次至第 6 项（索引 5）：顶部第 1 行必须锚定在原位
+			for (let i = 0; i < 5; i++) comp.handleInput("\x1b[B");
+			frames.push(comp.render(100));
+			// 再向下移动 5 次至第 11 项（索引 10，超出 10 行视口）：视口向下推进 1 行，总高度不变
+			for (let i = 0; i < 5; i++) comp.handleInput("\x1b[B");
+			frames.push(comp.render(100));
+			comp.handleInput("\x1b");
+		};
+
+		await h.run("models");
+
+		assert.equal(frames.length, 3);
+		// 所有帧总行数严格一致
+		assert.equal(frames[0]!.length, frames[1]!.length);
+		assert.equal(frames[1]!.length, frames[2]!.length);
+		// 第 1 帧与第 2 帧的第 1 个列表行都是「保存位置」（视口未跳动）
+		const firstListRowIndex = frames[0]!.findIndex((l) => l.includes("保存位置"));
+		assert.ok(firstListRowIndex >= 0);
+		assert.equal(frames[1]![firstListRowIndex]!.includes("保存位置"), true);
+		// 第 3 帧滚动推进后，「保存位置」滚出顶部，底栏显示 11/14 ↕（12 个自动发现模型 + 2 个顶部操作）
+		assert.equal(frames[2]![firstListRowIndex]!.includes("保存位置"), false);
+		assert.equal(frames[2]!.some((l) => l.includes("11/14 ↕")), true);
+	});
+
+	it("/fusion health manage 在重置冷却模型前后列表长度与固定管理项行号保持不变", async () => {
+		writeProjectModels();
+		const h = createHarness(root);
+		await h.startSession();
+
+		for (const fn of h.handlers.get("message_end") ?? []) {
+			await fn(
+				{
+					message: {
+						role: "assistant",
+						provider: "openai",
+						model: "gpt-4o-mini",
+						stopReason: "error",
+						errorMessage: "429 rate limit",
+					},
+				},
+				h.ctx,
+			);
+		}
+
+		const renderedRounds: string[][] = [];
+		let round = 0;
+		(h.ctx as unknown as { mode: string }).mode = "tui";
+		(h.ctx.ui as unknown as { custom: unknown }).custom = async (
+			factory: (
+				tui: { requestRender: () => void },
+				theme: { fg: (_c: string, s: string) => string; bold: (s: string) => string },
+				kb: unknown,
+				done: (result: unknown) => void,
+			) => { render: (w: number) => string[]; handleInput: (d: string) => void },
+		) => {
+			let finished = false;
+			const comp = factory(
+				{ requestRender: () => {} },
+				{ fg: (_c: string, s: string) => s, bold: (s: string) => s },
+				{},
+				() => {
+					finished = true;
+				},
+			);
+			renderedRounds.push(comp.render(100));
+			if (round === 0) {
+				round++;
+				// 首项为「重置全部模型健康状态」，按 Enter 执行重置后重新渲染列表
+				comp.handleInput("\r");
+			} else if (!finished) {
+				comp.handleInput("\x1b");
+			}
+		};
+
+		await h.run("health manage");
+
+		assert.equal(renderedRounds.length, 2);
+		const before = renderedRounds[0]!;
+		const after = renderedRounds[1]!;
+		// 重置前后总行数与每一固定项所在行号完全一致
+		assert.equal(before.length, after.length);
+		assert.equal(
+			before.findIndex((l) => l.includes("健康冷却追踪")),
+			after.findIndex((l) => l.includes("健康冷却追踪")),
+		);
+		assert.equal(
+			before.findIndex((l) => l.split("│")[0]!.includes("openai/gpt-4o-mini")),
+			after.findIndex((l) => l.split("│")[0]!.includes("openai/gpt-4o-mini")),
+		);
+		assert.equal(before.some((l) => l.includes("1 个异常")), true);
+		assert.equal(after.some((l) => l.includes("全部健康")), true);
 	});
 });
