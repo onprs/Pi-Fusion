@@ -553,7 +553,7 @@ describe("index 扩展集成与命令冒烟测试", () => {
 		assert.equal(health.cooldownSeconds, 120);
 	});
 
-	it("TUI 模式下固定高度双栏工作台切页与移动光标高度恒定、右栏聚焦当前项并自适应窄屏", async () => {
+	it("TUI 模式下单栏固定高度工作台无右侧冗余板块、切页与改值列对齐和高度均恒定", async () => {
 		writeProjectModels();
 		const h = createHarness(root, { withBranchState: true });
 		await h.startSession();
@@ -583,19 +583,22 @@ describe("index 扩展集成与命令冒烟测试", () => {
 
 			// 分区 1 首项
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 移至「最近一次决策详情」
+			// 移至「运行模式」并用空格从 auto 切换至 observe，验证固定槽位不引起后续说明列偏移
 			comp.handleInput("\x1b[B");
+			comp.handleInput(" ");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			// 切回 auto，再移至「最近一次决策详情」
+			comp.handleInput(" ");
 			comp.handleInput("\x1b[B");
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 切换至分区 2「路由策略」
-			comp.handleInput("\x1b[C");
-			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 切换至分区 3「模型与分类器」与分区 4「健康与测试」
+			// 切换至分区 2「路由策略」、分区 3「模型与分类器」、分区 4「健康与测试」
 			comp.handleInput("\x1b[C");
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
 			comp.handleInput("\x1b[C");
 			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
-			// 按数字键 1 切回分区 1，上移两次回到首项「路由器总开关」，按空格切换后再采样一次并按 Esc 关闭
+			comp.handleInput("\x1b[C");
+			snapshots.push({ wide: comp.render(100), narrow: comp.render(60) });
+			// 按数字键 1 切回分区 1，上移两次回到首项「路由器总开关」，按空格停用后按 Esc 关闭
 			comp.handleInput("1");
 			comp.handleInput("\x1b[A");
 			comp.handleInput("\x1b[A");
@@ -608,34 +611,32 @@ describe("index 扩展集成与命令冒烟测试", () => {
 		await h.run("");
 
 		const firstWide = snapshots[0]!.wide;
+		const secondWide = snapshots[1]!.wide;
+		const explainWide = snapshots[2]!.wide;
+		const policyWide = snapshots[3]!.wide;
 		const firstNarrow = snapshots[0]!.narrow;
 
-		// 切页、移动光标、切换开关后，宽屏与窄屏的总行数均严格恒定，零跳动
-		const wideHeights = new Set(snapshots.map((s) => s.wide.length));
-		const narrowHeights = new Set(snapshots.map((s) => s.narrow.length));
-		assert.equal(wideHeights.size, 1);
-		assert.equal(narrowHeights.size, 1);
+		// 切页、移动光标、切换开关后，宽屏与窄屏的总行数均严格恒定
+		assert.equal(new Set(snapshots.map((s) => s.wide.length)).size, 1);
+		assert.equal(new Set(snapshots.map((s) => s.narrow.length)).size, 1);
 		assert.equal(firstWide.length, 18);
 
-		// 宽屏包含 4 个横向分区标签与左右双栏竖向分隔线 │，每行不超宽
+		// 宽屏无右侧概览板块与分栏竖线，直接在列表行展示名称、状态与精简说明，每行不超宽
 		assert.equal(firstWide.some((l) => l.includes("概览与诊断") && l.includes("路由策略") && l.includes("模型与分类器")), true);
-		assert.equal(firstWide.some((l) => l.includes("路由器总开关") && l.includes("│") && l.includes("路由状态概览")), true);
+		assert.equal(firstWide.some((l) => l.includes("路由状态概览")), false);
+		const modeRowAuto = firstWide.find((l) => l.includes("运行模式"))!;
+		const modeRowObserve = secondWide.find((l) => l.includes("运行模式"))!;
+		assert.equal(modeRowAuto.includes("│"), false);
+		assert.equal(modeRowAuto.indexOf("auto 按决策"), modeRowObserve.indexOf("auto 按决策"));
 		assert.equal(firstWide.every((l) => visibleWidth(l) <= 100), true);
 
-		// 窄屏自动退化为固定高度上下布局且每行不超过 60 列
+		// 行内直接展示最近一次决策摘要（含 restored）与思考模式选项（含 passthrough）
+		assert.equal(explainWide.some((l) => l.includes("最近一次决策详情") && l.includes("restored")), true);
+		assert.equal(policyWide.some((l) => l.includes("思考强度模式") && l.includes("passthrough")), true);
+
+		// 窄屏每行不超过 60 列，并在底部固定 1 行展示当前选中项说明
 		assert.equal(firstNarrow.every((l) => visibleWidth(l) <= 60), true);
-		assert.equal(firstNarrow.some((l) => l.includes("路由器总开关") && l.includes("路由状态概览")), false);
-
-		// 光标移到「最近一次决策详情」后，右栏实时展示最近决策诊断（含 restored）
-		const secondWide = snapshots[1]!.wide;
-		assert.equal(secondWide.some((l) => l.includes("最近决策诊断")), true);
-		assert.equal(secondWide.some((l) => l.includes("restored")), true);
-
-		// 切到分区 2「路由策略」后，右栏聚焦当前选中项「思考强度模式」说明，不再整页复读所有策略
-		const thirdWide = snapshots[2]!.wide;
-		assert.equal(thirdWide.some((l) => l.includes("思考强度模式") && l.includes("│")), true);
-		assert.equal(thirdWide.some((l) => l.includes("passthrough")), true);
-		assert.equal(thirdWide.some((l) => l.includes("当前策略总览")), false);
+		assert.equal(snapshots[2]!.narrow.some((l) => l.includes("restored")), true);
 
 		// 空格切换总开关已保存生效
 		assert.equal(h.readJson(h.projectPath).enabled, false);
